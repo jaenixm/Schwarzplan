@@ -1,0 +1,23 @@
+[project]
+name = "schwarzplan"
+version = "1.0.0"
+description = "Generate architectural figure-ground diagrams (Schwarzplan) from OpenStreetMap data"
+requires-python = ">=3.10"
+dependencies = [
+    "flet>=0.25.0",
+    "flet-map>=0.2.0",
+    "osmnx>=2.0.0",
+    "matplotlib>=3.8.0",
+    "geopandas>=1.0.0",
+    "shapely>=2.0.0",
+]
+
+[tool.flet]
+product = "Schwarzplan Generator"
+org = "com.schwarzplan"
+company = "Schwarzplan"
+copyright = "Copyright 2026"
+
+[tool.flet.app]
+path = "src"
+module = "main"
