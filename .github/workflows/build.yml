@@ -5,6 +5,8 @@ on:
     branches: [main]
     tags: ['v*']
   workflow_dispatch:
+env:
+  PYTHONIOENCODING: utf-8
 
 jobs:
   build-macos:
@@ -15,7 +17,10 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
+
+      - name: Install System Dependencies
+        run: brew install gdal geos
 
       - name: Install Flet
         run: pip install flet
@@ -37,7 +42,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
 
       - name: Install Flet
         run: pip install flet
