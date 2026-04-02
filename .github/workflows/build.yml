@@ -26,7 +26,7 @@ jobs:
         run: pip install flet
 
       - name: Build macOS app
-        run: flet build macos --verbose
+        run: flet build macos --verbose --yes
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
@@ -48,7 +48,7 @@ jobs:
         run: pip install flet
 
       - name: Build Windows app
-        run: flet build windows --verbose
+        run: flet build windows --verbose --yes --no-rich-output
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
