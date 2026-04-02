@@ -188,6 +188,7 @@ def main(page: ft.Page):
         lat_field.value = str(selected_lat)
         lon_field.value = str(selected_lon)
         marker_layer_ref.current.markers = [create_marker(selected_lat, selected_lon)]
+        marker_layer_ref.current.update()
         page.update()
 
     the_map = ftm.Map(
