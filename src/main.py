@@ -6,15 +6,28 @@ from OpenStreetMap building data at exact architectural scales.
 """
 
 import os
-import threading
-import flet as ft
-import flet_map as ftm
+import sys
+import traceback
 
-from schwarzplan_engine import (
-    generate_schwarzplan,
-    PAPER_SIZES,
-    SCALE_OPTIONS,
-)
+def __log_crash(e):
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    if not os.path.exists(desktop): desktop = os.path.expanduser("~")
+    with open(os.path.join(desktop, "schwarzplan_crash.txt"), "w") as f:
+        f.write("A fatal error occurred during Schwarzplan App launch:\n\n" + traceback.format_exc())
+
+try:
+    import threading
+    import flet as ft
+    import flet_map as ftm
+
+    from schwarzplan_engine import (
+        generate_schwarzplan,
+        PAPER_SIZES,
+        SCALE_OPTIONS,
+    )
+except Exception as e:
+    __log_crash(e)
+    raise
 
 
 # ── Color Palette ──────────────────────────────────────────────────
@@ -398,4 +411,8 @@ def main(page: ft.Page):
     )
 
 
-ft.run(main)
+try:
+    ft.run(main)
+except Exception as e:
+    __log_crash(e)
+    raise

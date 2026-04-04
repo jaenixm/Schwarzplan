@@ -28,6 +28,20 @@ jobs:
       - name: Build macOS app
         run: flet build macos --verbose --yes
 
+      - name: Inject macOS dot-folders
+        run: |
+          echo "Downloading dependencies to extract .dylibs"
+          pip install --target /tmp/inject_deps Pillow numpy fiona pyproj shapely geopandas osmnx
+          SITE_PACKAGES="build/macos/schwarzplan.app/Contents/Frameworks/serious_python_darwin.framework/Resources/python.bundle/Contents/Resources/site-packages"
+          mkdir -p "$SITE_PACKAGES"
+          find /tmp/inject_deps -type d -name ".dylibs" -print0 | while IFS= read -r -d '' dir; do
+            parent=$(dirname "$dir")
+            pkgname=$(basename "$parent")
+            echo "Injecting $dir into $pkgname"
+            if [ -d "$dir" ]; then
+              cp -a "$dir" "$SITE_PACKAGES/$pkgname/"
+            fi
+          done
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
