@@ -205,12 +205,12 @@ def main(page: ft.Page):
 
     # ── File Picker ────────────────────────────────────────────────
     file_picker = ft.FilePicker()
-    page.overlay.append(file_picker)
+    page.services.append(file_picker)
 
-    def browse_clicked(e):
+    async def browse_clicked(e):
         fmt = format_dropdown.value or "pdf"
         default_name = filename_field.value or f"schwarzplan.{fmt}"
-        result = file_picker.save_file(
+        result = await file_picker.save_file(
             dialog_title="Save Schwarzplan Diagram",
             file_name=default_name,
             allowed_extensions=[fmt, "pdf", "svg", "dxf"],
