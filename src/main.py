@@ -7,16 +7,22 @@ from OpenStreetMap building data at exact architectural scales.
 
 import os
 import sys
+import tempfile
 import traceback
+import threading
 
 def __log_crash(e):
-    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-    if not os.path.exists(desktop): desktop = os.path.expanduser("~")
-    with open(os.path.join(desktop, "schwarzplan_crash.txt"), "w") as f:
-        f.write("A fatal error occurred during Schwarzplan App launch:\n\n" + traceback.format_exc())
+    try:
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        if not os.path.exists(desktop) or not os.access(desktop, os.W_OK):
+            desktop = tempfile.gettempdir()
+        log_path = os.path.join(desktop, "schwarzplan_crash.txt")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("A fatal error occurred during Schwarzplan App launch:\n\n" + traceback.format_exc())
+    except Exception:
+        pass
 
 try:
-    import threading
     import flet as ft
     import flet_map as ftm
 
@@ -24,6 +30,7 @@ try:
         generate_schwarzplan,
         PAPER_SIZES,
         SCALE_OPTIONS,
+        SUPPORTED_FORMATS,
     )
 except Exception as e:
     __log_crash(e)
@@ -49,10 +56,10 @@ def main(page: ft.Page):
     page.title = "Schwarzplan Generator"
     page.bgcolor = BG_DARK
     page.padding = 0
-    page.window.min_width = 960
-    page.window.min_height = 640
-    page.window.width = 1200
-    page.window.height = 780
+    page.window.min_width = 980
+    page.window.min_height = 660
+    page.window.width = 1240
+    page.window.height = 800
     page.fonts = {
         "Inter": "https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap",
     }
@@ -80,7 +87,7 @@ def main(page: ft.Page):
     def section_header(text):
         return ft.Container(
             content=ft.Text(text, size=13, weight=ft.FontWeight.W_600, color=TEXT_PRIMARY),
-            margin=ft.Margin.only(bottom=8, top=4),
+            margin=ft.Margin.only(bottom=6, top=4),
         )
 
     _pad_field = ft.Padding.symmetric(horizontal=12, vertical=4)
@@ -95,7 +102,7 @@ def main(page: ft.Page):
             color=TEXT_PRIMARY,
             cursor_color=ACCENT,
             border_radius=8,
-            height=48,
+            height=46,
             content_padding=_pad_field,
         )
         defaults.update(kwargs)
@@ -109,7 +116,7 @@ def main(page: ft.Page):
             focused_border_color=ACCENT,
             color=TEXT_PRIMARY,
             border_radius=8,
-            height=48,
+            height=46,
             content_padding=_pad_field,
         )
         defaults.update(kwargs)
@@ -118,6 +125,7 @@ def main(page: ft.Page):
     # ── Input Fields ───────────────────────────────────────────────
     lat_field = styled_text_field(value=str(selected_lat), label="Latitude")
     lon_field = styled_text_field(value=str(selected_lon), label="Longitude")
+
     scale_dropdown = styled_dropdown(
         value="1000",
         options=[ft.dropdown.Option(str(s), f"1:{s:,}") for s in SCALE_OPTIONS],
@@ -127,14 +135,66 @@ def main(page: ft.Page):
         options=[ft.dropdown.Option(k) for k in PAPER_SIZES.keys()],
     )
     margin_field = styled_text_field(
-        value="15", label="Border (mm)", keyboard_type=ft.KeyboardType.NUMBER,
+        value="15", label="Border Margin (mm)", keyboard_type=ft.KeyboardType.NUMBER,
     )
-    filename_field = styled_text_field(value="schwarzplan.pdf", label="Filename")
+    format_dropdown = styled_dropdown(
+        value="pdf",
+        options=[
+            ft.dropdown.Option("pdf", "PDF (Vector Print)"),
+            ft.dropdown.Option("svg", "SVG (Illustrator/Vector)"),
+            ft.dropdown.Option("dxf", "DXF (CAD / AutoCAD)"),
+        ],
+    )
+    filename_field = styled_text_field(value="schwarzplan_a3_1_1000.pdf", label="Filename")
+
+    # ── Coverage Badge ─────────────────────────────────────────────
+    coverage_text = ft.Text("Coverage: calculating…", size=11, color=ACCENT, weight=ft.FontWeight.W_500)
+    coverage_badge = ft.Container(
+        content=ft.Row([
+            ft.Icon(ft.Icons.SQUARE_FOOT, color=ACCENT, size=14),
+            coverage_text,
+        ], spacing=4),
+        bgcolor=ft.Colors.with_opacity(0.12, ACCENT),
+        border_radius=6,
+        padding=ft.Padding.symmetric(horizontal=8, vertical=4),
+        margin=ft.Margin.only(top=4, bottom=4),
+    )
+
+    def update_coverage_and_filename(e=None):
+        try:
+            scale_val = int(scale_dropdown.value)
+            paper_key = paper_dropdown.value
+            margin_mm = float(margin_field.value or "15")
+            fmt_ext = format_dropdown.value or "pdf"
+
+            if paper_key in PAPER_SIZES:
+                p = PAPER_SIZES[paper_key]
+                mw = (p["width_mm"] - 2 * margin_mm) / 1000.0 * scale_val
+                mh = (p["height_mm"] - 2 * margin_mm) / 1000.0 * scale_val
+                area_km2 = (mw * mh) / 1_000_000.0
+
+                if mw > 0 and mh > 0:
+                    coverage_text.value = f"Coverage: {mw:.0f}m × {mh:.0f}m ({area_km2:.2f} km²)"
+                else:
+                    coverage_text.value = "Margin exceeds paper size"
+
+                # Update default filename if user hasn't set custom path
+                if chosen_save_path[0] is None:
+                    safe_paper = paper_key.lower().replace(" ", "_").replace("×", "x")
+                    filename_field.value = f"schwarzplan_{safe_paper}_1_{scale_val}.{fmt_ext}"
+            page.update()
+        except Exception:
+            pass
+
+    scale_dropdown.on_change = update_coverage_and_filename
+    paper_dropdown.on_change = update_coverage_and_filename
+    margin_field.on_change = update_coverage_and_filename
+    format_dropdown.on_change = update_coverage_and_filename
 
     # ── Progress / Status ──────────────────────────────────────────
     progress_bar = ft.ProgressBar(
         value=0, color=ACCENT, bgcolor=BG_INPUT,
-        bar_height=3, border_radius=2, visible=False,
+        bar_height=4, border_radius=2, visible=False,
     )
     status_text = ft.Text("", size=12, color=TEXT_SECONDARY, text_align=ft.TextAlign.CENTER)
     status_icon = ft.Icon(ft.Icons.INFO_OUTLINE, color=ACCENT, size=16, visible=False)
@@ -145,12 +205,15 @@ def main(page: ft.Page):
 
     # ── File Picker ────────────────────────────────────────────────
     file_picker = ft.FilePicker()
+    page.overlay.append(file_picker)
 
-    async def browse_clicked(e):
-        result = await file_picker.save_file(
-            dialog_title="Save Schwarzplan PDF",
-            file_name=filename_field.value or "schwarzplan.pdf",
-            allowed_extensions=["pdf"],
+    def browse_clicked(e):
+        fmt = format_dropdown.value or "pdf"
+        default_name = filename_field.value or f"schwarzplan.{fmt}"
+        result = file_picker.save_file(
+            dialog_title="Save Schwarzplan Diagram",
+            file_name=default_name,
+            allowed_extensions=[fmt, "pdf", "svg", "dxf"],
             file_type=ft.FilePickerFileType.CUSTOM,
         )
         if result:
@@ -200,8 +263,9 @@ def main(page: ft.Page):
         selected_lon = round(e.coordinates.longitude, 6)
         lat_field.value = str(selected_lat)
         lon_field.value = str(selected_lon)
-        marker_layer_ref.current.markers = [create_marker(selected_lat, selected_lon)]
-        marker_layer_ref.current.update()
+        if marker_layer_ref.current:
+            marker_layer_ref.current.markers = [create_marker(selected_lat, selected_lon)]
+            marker_layer_ref.current.update()
         page.update()
 
     the_map = ftm.Map(
@@ -229,7 +293,7 @@ def main(page: ft.Page):
                     content=ft.Row(
                         [
                             ft.Icon(ft.Icons.TOUCH_APP, size=14, color=TEXT_SECONDARY),
-                            ft.Text("Click on the map to set center point",
+                            ft.Text("Click anywhere on the map to set the center point",
                                     size=11, color=TEXT_SECONDARY),
                         ],
                         spacing=6,
@@ -257,7 +321,7 @@ def main(page: ft.Page):
             status_icon.visible = True
             status_icon.icon = ft.Icons.ERROR_OUTLINE
             status_icon.color = ERROR_RED
-            status_text.value = "Invalid coordinates."
+            status_text.value = "Invalid coordinate numbers."
             status_text.color = ERROR_RED
             page.update()
             return
@@ -269,23 +333,33 @@ def main(page: ft.Page):
 
         scale_val = int(scale_dropdown.value)
         paper_val = paper_dropdown.value
-        fname = filename_field.value or "schwarzplan.pdf"
-        output_path = chosen_save_path[0] or os.path.join(
-            os.path.expanduser("~"), "Desktop", fname
-        )
+        fmt_val = format_dropdown.value or "pdf"
+
+        fname = filename_field.value or f"schwarzplan.{fmt_val}"
+        if not any(fname.lower().endswith(ext) for ext in SUPPORTED_FORMATS):
+            fname = f"{fname}.{fmt_val}"
+
+        desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+        if not os.path.exists(desktop_path) or not os.access(desktop_path, os.W_OK):
+            desktop_path = os.path.expanduser("~")
+
+        output_path = chosen_save_path[0] or os.path.join(desktop_path, fname)
 
         generate_btn.disabled = True
         progress_bar.visible = True
         progress_bar.value = 0
         status_icon.visible = False
-        status_text.value = "Starting…"
+        status_text.value = "Contacting OpenStreetMap…"
         status_text.color = TEXT_SECONDARY
         page.update()
 
         def on_progress(text, pct):
             progress_bar.value = pct if pct >= 0 else None
             status_text.value = text
-            page.update()
+            try:
+                page.update()
+            except Exception:
+                pass
 
         def run_generation():
             result = generate_schwarzplan(
@@ -301,7 +375,8 @@ def main(page: ft.Page):
                 status_icon.visible = True
                 status_icon.icon = ft.Icons.CHECK_CIRCLE_OUTLINE
                 status_icon.color = SUCCESS_GREEN
-                status_text.value = f"✓ Saved to {result['output_path']}"
+                count_info = f" ({result.get('building_count', 0)} buildings)"
+                status_text.value = f"✓ Saved {os.path.basename(result['output_path'])}{count_info}"
                 status_text.color = SUCCESS_GREEN
             else:
                 progress_bar.visible = False
@@ -310,7 +385,10 @@ def main(page: ft.Page):
                 status_icon.color = ERROR_RED
                 status_text.value = result["message"]
                 status_text.color = ERROR_RED
-            page.update()
+            try:
+                page.update()
+            except Exception:
+                pass
 
         threading.Thread(target=run_generation, daemon=True).start()
 
@@ -327,37 +405,41 @@ def main(page: ft.Page):
                             ft.Icon(ft.Icons.GRID_ON_ROUNDED, color=ACCENT, size=22),
                             ft.Text("Schwarzplan", size=20, weight=ft.FontWeight.W_700, color=TEXT_PRIMARY),
                         ], spacing=8),
-                        ft.Text("Figure-Ground Diagram Generator", size=11, color=TEXT_SECONDARY),
+                        ft.Text("Architectural Figure-Ground Generator", size=11, color=TEXT_SECONDARY),
                     ], spacing=2),
-                    padding=ft.Padding.only(bottom=16),
+                    padding=ft.Padding.only(bottom=14),
                 ),
                 ft.Divider(height=1, color=BORDER_SUBTLE),
 
                 # Location
-                ft.Container(height=8),
-                section_header("📍  Location"),
+                ft.Container(height=6),
+                section_header("📍  Center Coordinates"),
                 ft.Row([lat_field, lon_field], spacing=8),
 
-                ft.Container(height=12),
+                ft.Container(height=10),
                 ft.Divider(height=1, color=BORDER_SUBTLE),
 
                 # Settings
-                ft.Container(height=8),
-                section_header("⚙️  Settings"),
-                label("Scale"),
+                ft.Container(height=6),
+                section_header("⚙️  Scale & Format"),
+                label("Architectural Scale"),
                 scale_dropdown,
-                ft.Container(height=8),
-                label("Paper Size"),
+                ft.Container(height=6),
+                label("Paper Format & Orientation"),
                 paper_dropdown,
-                ft.Container(height=8),
-                margin_field,
+                ft.Container(height=6),
+                ft.Row([
+                    ft.Container(content=margin_field, expand=True),
+                    ft.Container(content=format_dropdown, expand=True),
+                ], spacing=8),
+                coverage_badge,
 
-                ft.Container(height=12),
+                ft.Container(height=10),
                 ft.Divider(height=1, color=BORDER_SUBTLE),
 
                 # Output
-                ft.Container(height=8),
-                section_header("📄  Output"),
+                ft.Container(height=6),
+                section_header("📄  Save Output"),
                 ft.Row(
                     [ft.Container(content=filename_field, expand=True), browse_btn],
                     spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -372,17 +454,17 @@ def main(page: ft.Page):
                         progress_bar,
                         ft.Container(content=generate_btn, alignment=ft.Alignment.CENTER),
                         status_row,
-                    ], spacing=10, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                    ], spacing=8, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
                     padding=ft.Padding.only(top=8),
                 ),
             ],
             spacing=2,
             scroll=ft.ScrollMode.AUTO,
         ),
-        width=320,
+        width=330,
         bgcolor=BG_PANEL,
         border_radius=ft.BorderRadius.only(top_right=16, bottom_right=16),
-        padding=ft.Padding.all(20),
+        padding=ft.Padding.all(18),
         border=ft.Border.only(right=ft.BorderSide(1, BORDER_SUBTLE)),
     )
 
@@ -395,7 +477,7 @@ def main(page: ft.Page):
                     content=ft.Column([
                         ft.Container(
                             content=ft.Text(
-                                "Click a location on the map, adjust settings, then generate.",
+                                "Click a location on the map, adjust scale or paper format, then generate.",
                                 size=12, color=TEXT_SECONDARY, italic=True,
                             ),
                             padding=ft.Padding.only(left=4, bottom=4),
@@ -403,16 +485,21 @@ def main(page: ft.Page):
                         map_container,
                     ], spacing=0),
                     expand=True,
-                    padding=ft.Padding.only(top=16, right=16, bottom=16, left=12),
+                    padding=ft.Padding.only(top=14, right=16, bottom=14, left=12),
                 ),
             ],
             expand=True, spacing=0,
         ),
     )
 
+    # Initialize coverage calculation
+    update_coverage_and_filename()
 
-try:
-    ft.run(main)
-except Exception as e:
-    __log_crash(e)
-    raise
+
+if __name__ == "__main__":
+    try:
+        ft.run(main)
+    except Exception as e:
+        __log_crash(e)
+        raise
+

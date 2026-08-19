@@ -5,6 +5,7 @@ on:
     branches: [main]
     tags: ['v*']
   workflow_dispatch:
+
 env:
   PYTHONIOENCODING: utf-8
 
@@ -17,10 +18,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-
-      - name: Install System Dependencies
-        run: brew install gdal geos
+          python-version: '3.12'
 
       - name: Install Flet
         run: pip install flet
@@ -28,25 +26,16 @@ jobs:
       - name: Build macOS app
         run: flet build macos --verbose --yes
 
-      - name: Inject macOS dot-folders
+      - name: Package macOS App
         run: |
-          echo "Downloading dependencies to extract .dylibs"
-          pip install --target /tmp/inject_deps Pillow numpy fiona pyproj shapely geopandas osmnx
-          SITE_PACKAGES="build/macos/schwarzplan.app/Contents/Frameworks/serious_python_darwin.framework/Resources/python.bundle/Contents/Resources/site-packages"
-          mkdir -p "$SITE_PACKAGES"
-          find /tmp/inject_deps -type d -name ".dylibs" -print0 | while IFS= read -r -d '' dir; do
-            parent=$(dirname "$dir")
-            pkgname=$(basename "$parent")
-            echo "Injecting $dir into $pkgname"
-            if [ -d "$dir" ]; then
-              cp -a "$dir" "$SITE_PACKAGES/$pkgname/"
-            fi
-          done
+          cd build/macos
+          zip -r -q ../../Schwarzplan-macOS.zip schwarzplan.app
+
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
           name: Schwarzplan-macOS
-          path: build/macos/
+          path: Schwarzplan-macOS.zip
 
   build-windows:
     runs-on: windows-latest
@@ -56,7 +45,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Install Flet
         run: pip install flet
@@ -64,8 +53,14 @@ jobs:
       - name: Build Windows app
         run: flet build windows --verbose --yes --no-rich-output
 
+      - name: Package Windows App
+        shell: pwsh
+        run: |
+          Compress-Archive -Path build/windows/* -DestinationPath Schwarzplan-Windows.zip
+
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: Schwarzplan-Windows
-          path: build/windows/
+          path: Schwarzplan-Windows.zip
+
