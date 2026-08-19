@@ -7,9 +7,14 @@ from OpenStreetMap building data at exact architectural scales.
 
 import os
 import sys
+import ssl
+import json
+import math
 import tempfile
 import traceback
 import threading
+import urllib.request
+import urllib.parse
 
 def __log_crash(e):
     try:
@@ -37,70 +42,124 @@ except Exception as e:
     raise
 
 
-# ── Color Palette ──────────────────────────────────────────────────
-BG_DARK = "#0D0D0D"
-BG_PANEL = "#161616"
-BG_CARD = "#1E1E1E"
-BG_INPUT = "#252525"
-ACCENT = "#4FC3F7"
-ACCENT_HOVER = "#81D4FA"
-TEXT_PRIMARY = "#F0F0F0"
-TEXT_SECONDARY = "#8A8A8A"
-BORDER_SUBTLE = "#2A2A2A"
+# ── Color Palettes & Basemaps ──────────────────────────────────────
+DARK_PALETTE = {
+    "bg_dark": "#0D0D0D",
+    "bg_panel": "#161616",
+    "bg_card": "#1E1E1E",
+    "bg_input": "#252525",
+    "text_primary": "#F0F0F0",
+    "text_secondary": "#8A8A8A",
+    "border_subtle": "#2A2A2A",
+    "accent": "#4FC3F7",
+    "accent_hover": "#81D4FA",
+    "tile_url": "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+}
+
+LIGHT_PALETTE = {
+    "bg_dark": "#F4F6F8",
+    "bg_panel": "#FFFFFF",
+    "bg_card": "#FFFFFF",
+    "bg_input": "#ECEFF1",
+    "text_primary": "#1A202C",
+    "text_secondary": "#718096",
+    "border_subtle": "#E2E8F0",
+    "accent": "#0288D1",
+    "accent_hover": "#039BE5",
+    "tile_url": "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+}
+
 SUCCESS_GREEN = "#66BB6A"
 ERROR_RED = "#EF5350"
 
 
+def calculate_bbox_corners(center_lat: float, center_lon: float, paper_w_mm: float, paper_h_mm: float, margin_mm: float, scale: int):
+    """
+    Computes geographic coordinates (NW, NE, SE, SW) of the exact printed map area.
+    """
+    map_w_mm = max(10.0, paper_w_mm - 2 * margin_mm)
+    map_h_mm = max(10.0, paper_h_mm - 2 * margin_mm)
+    real_w_m = (map_w_mm / 1000.0) * scale
+    real_h_m = (map_h_mm / 1000.0) * scale
+
+    lat_rad = math.radians(center_lat)
+    # WGS84 metric meters per degree
+    m_per_deg_lat = 111132.92 - 559.82 * math.cos(2 * lat_rad) + 1.175 * math.cos(4 * lat_rad)
+    m_per_deg_lon = 111412.84 * math.cos(lat_rad) - 93.5 * math.cos(3 * lat_rad)
+    if abs(m_per_deg_lon) < 1.0:
+        m_per_deg_lon = 1.0
+
+    d_lat = (real_h_m / 2.0) / m_per_deg_lat
+    d_lon = (real_w_m / 2.0) / m_per_deg_lon
+
+    nw = ftm.MapLatitudeLongitude(center_lat + d_lat, center_lon - d_lon)
+    ne = ftm.MapLatitudeLongitude(center_lat + d_lat, center_lon + d_lon)
+    se = ftm.MapLatitudeLongitude(center_lat - d_lat, center_lon + d_lon)
+    sw = ftm.MapLatitudeLongitude(center_lat - d_lat, center_lon - d_lon)
+
+    return [nw, ne, se, sw], real_w_m, real_h_m
+
+
 def main(page: ft.Page):
+    # ── Theme & OS Detection ───────────────────────────────────────
+    is_os_dark = False
+    try:
+        if hasattr(page, "platform_brightness") and page.platform_brightness == ft.Brightness.DARK:
+            is_os_dark = True
+    except Exception:
+        pass
+
+    is_dark = [is_os_dark]
+    selected_lat = [53.5581]
+    selected_lon = [9.9632]
+    chosen_save_path = [None]
+    last_generated_file = [None]
+
+    def current_theme():
+        return DARK_PALETTE if is_dark[0] else LIGHT_PALETTE
+
+    initial_pal = current_theme()
+
     # ── Page Setup ─────────────────────────────────────────────────
     page.title = "Schwarzplan Generator"
-    page.bgcolor = BG_DARK
+    page.bgcolor = initial_pal["bg_dark"]
     page.padding = 0
-    page.window.min_width = 980
-    page.window.min_height = 660
-    page.window.width = 1240
-    page.window.height = 800
+    page.window.min_width = 1020
+    page.window.min_height = 680
+    page.window.width = 1280
+    page.window.height = 840
     page.fonts = {
         "Inter": "https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap",
     }
     page.theme = ft.Theme(
         font_family="Inter",
         color_scheme=ft.ColorScheme(
-            primary=ACCENT,
-            on_primary="#000000",
-            surface=BG_CARD,
-            on_surface=TEXT_PRIMARY,
+            primary=initial_pal["accent"],
+            on_primary="#FFFFFF" if not is_dark[0] else "#000000",
+            surface=initial_pal["bg_card"],
+            on_surface=initial_pal["text_primary"],
         ),
     )
-    page.theme_mode = ft.ThemeMode.DARK
+    page.theme_mode = ft.ThemeMode.DARK if is_dark[0] else ft.ThemeMode.LIGHT
 
-    # ── State ──────────────────────────────────────────────────────
-    selected_lat = 53.5581
-    selected_lon = 9.9632
-    chosen_save_path = [None]
     marker_layer_ref = ft.Ref[ftm.MarkerLayer]()
+    polygon_layer_ref = ft.Ref[ftm.PolygonLayer]()
+    tile_layer_ref = ft.Ref[ftm.TileLayer]()
+    map_ref = ft.Ref[ftm.Map]()
 
     # ── Helpers ────────────────────────────────────────────────────
-    def label(text):
-        return ft.Text(text, size=11, weight=ft.FontWeight.W_500, color=TEXT_SECONDARY)
-
-    def section_header(text):
-        return ft.Container(
-            content=ft.Text(text, size=13, weight=ft.FontWeight.W_600, color=TEXT_PRIMARY),
-            margin=ft.Margin.only(bottom=6, top=4),
-        )
-
     _pad_field = ft.Padding.symmetric(horizontal=12, vertical=4)
 
     def styled_text_field(**kwargs):
+        pal = current_theme()
         defaults = dict(
             text_size=13,
-            label_style=ft.TextStyle(size=11, color=TEXT_SECONDARY),
-            bgcolor=BG_INPUT,
-            border_color=BORDER_SUBTLE,
-            focused_border_color=ACCENT,
-            color=TEXT_PRIMARY,
-            cursor_color=ACCENT,
+            label_style=ft.TextStyle(size=11, color=pal["text_secondary"]),
+            bgcolor=pal["bg_input"],
+            border_color=pal["border_subtle"],
+            focused_border_color=pal["accent"],
+            color=pal["text_primary"],
+            cursor_color=pal["accent"],
             border_radius=8,
             height=46,
             content_padding=_pad_field,
@@ -109,12 +168,13 @@ def main(page: ft.Page):
         return ft.TextField(**defaults)
 
     def styled_dropdown(**kwargs):
+        pal = current_theme()
         defaults = dict(
             text_size=13,
-            bgcolor=BG_INPUT,
-            border_color=BORDER_SUBTLE,
-            focused_border_color=ACCENT,
-            color=TEXT_PRIMARY,
+            bgcolor=pal["bg_input"],
+            border_color=pal["border_subtle"],
+            focused_border_color=pal["accent"],
+            color=pal["text_primary"],
             border_radius=8,
             height=46,
             content_padding=_pad_field,
@@ -122,9 +182,27 @@ def main(page: ft.Page):
         defaults.update(kwargs)
         return ft.Dropdown(**defaults)
 
+    # ── Section Headers & Labels ───────────────────────────────────
+    title_text = ft.Text("Schwarzplan", size=20, weight=ft.FontWeight.W_700, color=initial_pal["text_primary"])
+    subtitle_text = ft.Text("Architectural Figure-Ground Generator", size=11, color=initial_pal["text_secondary"])
+    app_icon = ft.Icon(ft.Icons.GRID_ON_ROUNDED, color=initial_pal["accent"], size=22)
+
+    coords_header = ft.Text("📍  Center Coordinates", size=13, weight=ft.FontWeight.W_600, color=initial_pal["text_primary"])
+    scale_header = ft.Text("⚙️  Scale & Format", size=13, weight=ft.FontWeight.W_600, color=initial_pal["text_primary"])
+    context_header = ft.Text("🌊  Urban Context Layers", size=13, weight=ft.FontWeight.W_600, color=initial_pal["text_primary"])
+    output_header = ft.Text("📄  Save Output", size=13, weight=ft.FontWeight.W_600, color=initial_pal["text_primary"])
+
+    scale_label = ft.Text("Architectural Scale", size=11, weight=ft.FontWeight.W_500, color=initial_pal["text_secondary"])
+    paper_label = ft.Text("Paper Format & Orientation", size=11, weight=ft.FontWeight.W_500, color=initial_pal["text_secondary"])
+
+    div1 = ft.Divider(height=1, color=initial_pal["border_subtle"])
+    div2 = ft.Divider(height=1, color=initial_pal["border_subtle"])
+    div3 = ft.Divider(height=1, color=initial_pal["border_subtle"])
+    div4 = ft.Divider(height=1, color=initial_pal["border_subtle"])
+
     # ── Input Fields ───────────────────────────────────────────────
-    lat_field = styled_text_field(value=str(selected_lat), label="Latitude")
-    lon_field = styled_text_field(value=str(selected_lon), label="Longitude")
+    lat_field = styled_text_field(value=str(selected_lat[0]), label="Latitude", expand=True)
+    lon_field = styled_text_field(value=str(selected_lon[0]), label="Longitude", expand=True)
 
     scale_dropdown = styled_dropdown(
         value="1000",
@@ -135,72 +213,219 @@ def main(page: ft.Page):
         options=[ft.dropdown.Option(k) for k in PAPER_SIZES.keys()],
     )
     margin_field = styled_text_field(
-        value="15", label="Border Margin (mm)", keyboard_type=ft.KeyboardType.NUMBER,
+        value="15", label="Border (mm)", keyboard_type=ft.KeyboardType.NUMBER, expand=True
     )
     format_dropdown = styled_dropdown(
         value="pdf",
         options=[
-            ft.dropdown.Option("pdf", "PDF (Vector Print)"),
-            ft.dropdown.Option("svg", "SVG (Illustrator/Vector)"),
-            ft.dropdown.Option("dxf", "DXF (CAD / AutoCAD)"),
+            ft.dropdown.Option("pdf", "PDF (Print)"),
+            ft.dropdown.Option("svg", "SVG (Vector)"),
+            ft.dropdown.Option("dxf", "DXF (CAD)"),
         ],
+        expand=True,
     )
     filename_field = styled_text_field(value="schwarzplan_a3_1_1000.pdf", label="Filename")
 
-    # ── Coverage Badge ─────────────────────────────────────────────
-    coverage_text = ft.Text("Coverage: calculating…", size=11, color=ACCENT, weight=ft.FontWeight.W_500)
+    # ── Urban Context Layers (Water & Greenery) ────────────────────
+    water_color_val = ["#C5DCE8" if not is_dark[0] else "#1E2D3D"]
+    greenery_color_val = ["#DCE8D8" if not is_dark[0] else "#203324"]
+
+    water_checkbox = ft.Checkbox(
+        label="Waterways (Blauplan)",
+        value=False,
+        label_style=ft.TextStyle(size=12, color=initial_pal["text_primary"], weight=ft.FontWeight.W_500),
+        active_color=initial_pal["accent"],
+    )
+    water_color_box = ft.Container(
+        width=20, height=20, border_radius=4,
+        bgcolor=water_color_val[0],
+        border=ft.Border.all(1, initial_pal["border_subtle"]),
+    )
+    water_color_field = styled_text_field(
+        value=water_color_val[0],
+        label="Water Hex",
+        width=100,
+        height=40,
+    )
+
+    def on_water_color_change(e):
+        hex_val = water_color_field.value.strip()
+        if len(hex_val) == 7 and hex_val.startswith("#"):
+            water_color_val[0] = hex_val
+            water_color_box.bgcolor = hex_val
+            page.update()
+
+    water_color_field.on_change = on_water_color_change
+
+    greenery_checkbox = ft.Checkbox(
+        label="Parks & Greenery (Grünplan)",
+        value=False,
+        label_style=ft.TextStyle(size=12, color=initial_pal["text_primary"], weight=ft.FontWeight.W_500),
+        active_color=initial_pal["accent"],
+    )
+    greenery_color_box = ft.Container(
+        width=20, height=20, border_radius=4,
+        bgcolor=greenery_color_val[0],
+        border=ft.Border.all(1, initial_pal["border_subtle"]),
+    )
+    greenery_color_field = styled_text_field(
+        value=greenery_color_val[0],
+        label="Green Hex",
+        width=100,
+        height=40,
+    )
+
+    def on_greenery_color_change(e):
+        hex_val = greenery_color_field.value.strip()
+        if len(hex_val) == 7 and hex_val.startswith("#"):
+            greenery_color_val[0] = hex_val
+            greenery_color_box.bgcolor = hex_val
+            page.update()
+
+    greenery_color_field.on_change = on_greenery_color_change
+
+    # ── Coverage Badge & Bounding Box Marker ───────────────────────
+    coverage_icon = ft.Icon(ft.Icons.SQUARE_FOOT, color=initial_pal["accent"], size=14)
+    coverage_text = ft.Text("Coverage: calculating…", size=11, color=initial_pal["accent"], weight=ft.FontWeight.W_500)
     coverage_badge = ft.Container(
         content=ft.Row([
-            ft.Icon(ft.Icons.SQUARE_FOOT, color=ACCENT, size=14),
+            coverage_icon,
             coverage_text,
         ], spacing=4),
-        bgcolor=ft.Colors.with_opacity(0.12, ACCENT),
+        bgcolor=ft.Colors.with_opacity(0.12, initial_pal["accent"]),
         border_radius=6,
         padding=ft.Padding.symmetric(horizontal=8, vertical=4),
         margin=ft.Margin.only(top=4, bottom=4),
     )
 
-    def update_coverage_and_filename(e=None):
+    bbox_poly_marker = ftm.PolygonMarker(
+        coordinates=[],
+        border_color=initial_pal["accent"],
+        border_stroke_width=2.5,
+        color=ft.Colors.with_opacity(0.18, initial_pal["accent"]),
+    )
+
+    def update_coverage_and_preview(e=None):
         try:
-            scale_val = int(scale_dropdown.value)
-            paper_key = paper_dropdown.value
+            scale_val = int(scale_dropdown.value or "1000")
+            paper_key = paper_dropdown.value or "A3 Landscape"
             margin_mm = float(margin_field.value or "15")
             fmt_ext = format_dropdown.value or "pdf"
+            p = PAPER_SIZES.get(paper_key, PAPER_SIZES["A3 Landscape"])
 
-            if paper_key in PAPER_SIZES:
-                p = PAPER_SIZES[paper_key]
-                mw = (p["width_mm"] - 2 * margin_mm) / 1000.0 * scale_val
-                mh = (p["height_mm"] - 2 * margin_mm) / 1000.0 * scale_val
-                area_km2 = (mw * mh) / 1_000_000.0
+            coords, rw, rh = calculate_bbox_corners(
+                selected_lat[0], selected_lon[0],
+                p["width_mm"], p["height_mm"],
+                margin_mm, scale_val,
+            )
 
-                if mw > 0 and mh > 0:
-                    coverage_text.value = f"Coverage: {mw:.0f}m × {mh:.0f}m ({area_km2:.2f} km²)"
-                else:
-                    coverage_text.value = "Margin exceeds paper size"
+            if rw > 0 and rh > 0:
+                area_km2 = (rw * rh) / 1_000_000.0
+                coverage_text.value = f"Print Coverage: {rw:.0f}m × {rh:.0f}m ({area_km2:.2f} km²)"
+            else:
+                coverage_text.value = "Margin exceeds paper size"
 
-                # Update default filename if user hasn't set custom path
-                if chosen_save_path[0] is None:
-                    safe_paper = paper_key.lower().replace(" ", "_").replace("×", "x")
-                    filename_field.value = f"schwarzplan_{safe_paper}_1_{scale_val}.{fmt_ext}"
+            if chosen_save_path[0] is None:
+                safe_paper = paper_key.lower().replace(" ", "_").replace("×", "x")
+                filename_field.value = f"schwarzplan_{safe_paper}_1_{scale_val}.{fmt_ext}"
+
+            bbox_poly_marker.coordinates = coords
+            if polygon_layer_ref.current:
+                polygon_layer_ref.current.polygons = [bbox_poly_marker]
+                try:
+                    polygon_layer_ref.current.update()
+                except Exception:
+                    pass
+
+            if map_ref.current:
+                try:
+                    map_ref.current.update()
+                except Exception:
+                    pass
+
             page.update()
         except Exception:
             pass
 
-    scale_dropdown.on_change = update_coverage_and_filename
-    paper_dropdown.on_change = update_coverage_and_filename
-    margin_field.on_change = update_coverage_and_filename
-    format_dropdown.on_change = update_coverage_and_filename
+    scale_dropdown.on_select = update_coverage_and_preview
+    scale_dropdown.on_change = update_coverage_and_preview
+    paper_dropdown.on_select = update_coverage_and_preview
+    paper_dropdown.on_change = update_coverage_and_preview
+    format_dropdown.on_select = update_coverage_and_preview
+    format_dropdown.on_change = update_coverage_and_preview
+    margin_field.on_change = update_coverage_and_preview
+    margin_field.on_blur = update_coverage_and_preview
 
-    # ── Progress / Status ──────────────────────────────────────────
+    # ── Coordinates manual edit handler ────────────────────────────
+    def on_coords_changed(e=None):
+        try:
+            lat = float(lat_field.value)
+            lon = float(lon_field.value)
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                selected_lat[0] = round(lat, 6)
+                selected_lon[0] = round(lon, 6)
+                if marker_layer_ref.current:
+                    marker_layer_ref.current.markers = [create_marker(selected_lat[0], selected_lon[0])]
+                    marker_layer_ref.current.update()
+                if map_ref.current:
+                    map_ref.current.move_to(
+                        destination=ftm.MapLatitudeLongitude(selected_lat[0], selected_lon[0])
+                    )
+                update_coverage_and_preview()
+        except Exception:
+            pass
+
+    lat_field.on_submit = on_coords_changed
+    lat_field.on_blur = on_coords_changed
+    lon_field.on_submit = on_coords_changed
+    lon_field.on_blur = on_coords_changed
+
+    # ── Progress / Status & Open Action ─────────────────────────────
     progress_bar = ft.ProgressBar(
-        value=0, color=ACCENT, bgcolor=BG_INPUT,
+        value=0, color=initial_pal["accent"], bgcolor=initial_pal["bg_input"],
         bar_height=4, border_radius=2, visible=False,
     )
-    status_text = ft.Text("", size=12, color=TEXT_SECONDARY, text_align=ft.TextAlign.CENTER)
-    status_icon = ft.Icon(ft.Icons.INFO_OUTLINE, color=ACCENT, size=16, visible=False)
+    status_text = ft.Text("", size=12, color=initial_pal["text_secondary"], text_align=ft.TextAlign.CENTER)
+    status_icon = ft.Icon(ft.Icons.INFO_OUTLINE, color=initial_pal["accent"], size=16, visible=False)
+
+    def open_generated_file(e):
+        path = last_generated_file[0]
+        if path and os.path.exists(path):
+            if sys.platform == "darwin":
+                os.system(f'open "{path}"')
+            elif sys.platform == "win32":
+                os.startfile(path)
+            else:
+                os.system(f'xdg-open "{path}"')
+
+    def open_folder(e):
+        path = last_generated_file[0]
+        if path and os.path.exists(path):
+            if sys.platform == "darwin":
+                os.system(f'open -R "{path}"')
+            elif sys.platform == "win32":
+                os.system(f'explorer /select,"{path}"')
+
+    open_file_btn = ft.IconButton(
+        icon=ft.Icons.OPEN_IN_NEW,
+        icon_color=SUCCESS_GREEN,
+        icon_size=18,
+        tooltip="Open file",
+        visible=False,
+        on_click=open_generated_file,
+    )
+    open_folder_btn = ft.IconButton(
+        icon=ft.Icons.FOLDER_ROUNDED,
+        icon_color=initial_pal["accent"],
+        icon_size=18,
+        tooltip="Reveal in Finder / Explorer",
+        visible=False,
+        on_click=open_folder,
+    )
+
     status_row = ft.Row(
-        [status_icon, status_text],
-        alignment=ft.MainAxisAlignment.CENTER, spacing=6,
+        [status_icon, status_text, open_file_btn, open_folder_btn],
+        alignment=ft.MainAxisAlignment.CENTER, spacing=4,
     )
 
     # ── File Picker ────────────────────────────────────────────────
@@ -223,7 +448,7 @@ def main(page: ft.Page):
 
     browse_btn = ft.IconButton(
         icon=ft.Icons.FOLDER_OPEN_ROUNDED,
-        icon_color=ACCENT, icon_size=18,
+        icon_color=initial_pal["accent"], icon_size=18,
         tooltip="Browse save location",
         on_click=browse_clicked,
         style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8)),
@@ -238,79 +463,240 @@ def main(page: ft.Page):
             ],
             alignment=ft.MainAxisAlignment.CENTER, spacing=8,
         ),
-        bgcolor=ACCENT, color="#000000", height=50, width=300,
+        bgcolor=initial_pal["accent"],
+        color="#000000" if is_dark[0] else "#FFFFFF",
+        height=50, width=320,
         style=ft.ButtonStyle(
             shape=ft.RoundedRectangleBorder(radius=10),
-            elevation=0, overlay_color=ACCENT_HOVER,
+            elevation=0, overlay_color=initial_pal["accent_hover"],
         ),
     )
 
-    # ── Map ────────────────────────────────────────────────────────
+    # ── Map & Layers ───────────────────────────────────────────────
     def create_marker(lat, lon):
         return ftm.Marker(
             coordinates=ftm.MapLatitudeLongitude(lat, lon),
-            content=ft.Icon(ft.Icons.LOCATION_ON, color=ERROR_RED, size=32),
+            content=ft.Icon(ft.Icons.LOCATION_ON, color=ERROR_RED, size=34),
         )
+
+    tile_layer = ftm.TileLayer(
+        ref=tile_layer_ref,
+        url_template=initial_pal["tile_url"],
+        user_agent_package_name="schwarzplan.app.user_agent",
+    )
+
+    polygon_layer = ftm.PolygonLayer(
+        ref=polygon_layer_ref,
+        polygons=[bbox_poly_marker],
+    )
 
     marker_layer = ftm.MarkerLayer(
         ref=marker_layer_ref,
-        markers=[create_marker(selected_lat, selected_lon)],
+        markers=[create_marker(selected_lat[0], selected_lon[0])],
     )
 
     def on_map_tap(e: ftm.MapTapEvent):
-        nonlocal selected_lat, selected_lon
-        selected_lat = round(e.coordinates.latitude, 6)
-        selected_lon = round(e.coordinates.longitude, 6)
-        lat_field.value = str(selected_lat)
-        lon_field.value = str(selected_lon)
+        selected_lat[0] = round(e.coordinates.latitude, 6)
+        selected_lon[0] = round(e.coordinates.longitude, 6)
+        lat_field.value = str(selected_lat[0])
+        lon_field.value = str(selected_lon[0])
         if marker_layer_ref.current:
-            marker_layer_ref.current.markers = [create_marker(selected_lat, selected_lon)]
+            marker_layer_ref.current.markers = [create_marker(selected_lat[0], selected_lon[0])]
             marker_layer_ref.current.update()
-        page.update()
+        update_coverage_and_preview()
 
     the_map = ftm.Map(
+        ref=map_ref,
         expand=True,
-        initial_center=ftm.MapLatitudeLongitude(selected_lat, selected_lon),
+        initial_center=ftm.MapLatitudeLongitude(selected_lat[0], selected_lon[0]),
         initial_zoom=14, min_zoom=3, max_zoom=19,
         on_tap=on_map_tap,
         interaction_configuration=ftm.InteractionConfiguration(
             flags=ftm.InteractionFlag.ALL,
         ),
         layers=[
-            ftm.TileLayer(
-                url_template="https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
-                user_agent_package_name="schwarzplan.app.user_agent",
-            ),
+            tile_layer,
+            polygon_layer,
             marker_layer,
         ],
     )
 
-    map_container = ft.Container(
-        content=ft.Stack([
-            the_map,
-            ft.Container(
-                content=ft.Container(
-                    content=ft.Row(
-                        [
-                            ft.Icon(ft.Icons.TOUCH_APP, size=14, color=TEXT_SECONDARY),
-                            ft.Text("Click anywhere on the map to set the center point",
-                                    size=11, color=TEXT_SECONDARY),
-                        ],
-                        spacing=6,
-                    ),
-                    bgcolor=ft.Colors.with_opacity(0.85, BG_DARK),
-                    border_radius=8,
-                    padding=ft.Padding.symmetric(horizontal=12, vertical=6),
-                ),
-                alignment=ft.Alignment.BOTTOM_CENTER,
-                margin=ft.Margin.only(bottom=12),
-            ),
-        ]),
+    # ── Geocoding Search ───────────────────────────────────────────
+    search_input = styled_text_field(
+        hint_text="Search any city, address, or landmark (e.g. Paris, Tokyo, Berlin Mitte, Manhattan)…",
         expand=True,
-        border_radius=12,
-        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-        border=ft.Border.all(1, BORDER_SUBTLE),
+        height=44,
     )
+    search_status = ft.Text("", size=11, color=initial_pal["text_secondary"])
+
+    def do_search(e=None):
+        query = (search_input.value or "").strip()
+        if not query:
+            return
+        search_status.value = "Searching OpenStreetMap…"
+        search_status.color = current_theme()["text_secondary"]
+        page.update()
+
+        def _search_thread():
+            try:
+                url = f"https://nominatim.openstreetmap.org/search?{urllib.parse.urlencode({'q': query, 'format': 'json', 'limit': 1})}"
+                req = urllib.request.Request(url, headers={"User-Agent": "SchwarzplanApp/2.0"})
+                ctx = ssl.create_default_context()
+                with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    if data:
+                        hit = data[0]
+                        new_lat = round(float(hit["lat"]), 6)
+                        new_lon = round(float(hit["lon"]), 6)
+                        display_name = hit.get("display_name", "")
+                        short_name = display_name.split(",")[0]
+
+                        selected_lat[0] = new_lat
+                        selected_lon[0] = new_lon
+                        lat_field.value = str(new_lat)
+                        lon_field.value = str(new_lon)
+
+                        if marker_layer_ref.current:
+                            marker_layer_ref.current.markers = [create_marker(new_lat, new_lon)]
+                            marker_layer_ref.current.update()
+                        if map_ref.current:
+                            map_ref.current.move_to(
+                                destination=ftm.MapLatitudeLongitude(new_lat, new_lon),
+                                zoom=14,
+                            )
+                        search_status.value = f"📍 Found: {short_name}"
+                        search_status.color = SUCCESS_GREEN
+                        update_coverage_and_preview()
+                    else:
+                        search_status.value = "No location found."
+                        search_status.color = ERROR_RED
+            except Exception as err:
+                search_status.value = f"Search error: {str(err)}"
+                search_status.color = ERROR_RED
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        threading.Thread(target=_search_thread, daemon=True).start()
+
+    search_input.on_submit = do_search
+    search_btn = ft.IconButton(
+        icon=ft.Icons.SEARCH_ROUNDED,
+        icon_color=initial_pal["accent"],
+        icon_size=20,
+        tooltip="Search location",
+        on_click=do_search,
+        style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8), bgcolor=initial_pal["bg_input"]),
+    )
+
+    # ── Theme Switcher ─────────────────────────────────────────────
+    theme_btn = ft.IconButton(
+        icon=ft.Icons.LIGHT_MODE_OUTLINED if is_dark[0] else ft.Icons.DARK_MODE_OUTLINED,
+        icon_color=initial_pal["accent"],
+        icon_size=20,
+        tooltip="Switch to Light Mode" if is_dark[0] else "Switch to Dark Mode",
+        style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8), bgcolor=initial_pal["bg_input"]),
+    )
+
+    all_styled_fields = [lat_field, lon_field, margin_field, filename_field, search_input, water_color_field, greenery_color_field]
+    all_styled_dropdowns = [scale_dropdown, paper_dropdown, format_dropdown]
+
+    def toggle_theme(e):
+        is_dark[0] = not is_dark[0]
+        pal = current_theme()
+
+        # Update page and theme mode
+        page.theme_mode = ft.ThemeMode.DARK if is_dark[0] else ft.ThemeMode.LIGHT
+        page.bgcolor = pal["bg_dark"]
+
+        # Update Map basemap tiles
+        if tile_layer_ref.current:
+            tile_layer_ref.current.url_template = pal["tile_url"]
+            tile_layer_ref.current.update()
+        if map_ref.current:
+            map_ref.current.update()
+
+        # Update Theme toggle button
+        theme_btn.icon = ft.Icons.LIGHT_MODE_OUTLINED if is_dark[0] else ft.Icons.DARK_MODE_OUTLINED
+        theme_btn.icon_color = pal["accent"]
+        theme_btn.tooltip = "Switch to Light Mode" if is_dark[0] else "Switch to Dark Mode"
+        theme_btn.style = ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8), bgcolor=pal["bg_input"])
+
+        # Update Sidebar colors
+        sidebar.bgcolor = pal["bg_panel"]
+        sidebar.border = ft.Border.only(right=ft.BorderSide(1, pal["border_subtle"]))
+        map_box.border = ft.Border.all(1, pal["border_subtle"])
+
+        # Update Text & Icons
+        title_text.color = pal["text_primary"]
+        subtitle_text.color = pal["text_secondary"]
+        app_icon.color = pal["accent"]
+        coords_header.color = pal["text_primary"]
+        scale_header.color = pal["text_primary"]
+        context_header.color = pal["text_primary"]
+        output_header.color = pal["text_primary"]
+        scale_label.color = pal["text_secondary"]
+        paper_label.color = pal["text_secondary"]
+        bottom_helper_text.color = pal["text_secondary"]
+        bottom_helper_icon.color = pal["text_secondary"]
+
+        div1.color = pal["border_subtle"]
+        div2.color = pal["border_subtle"]
+        div3.color = pal["border_subtle"]
+        div4.color = pal["border_subtle"]
+
+        # Update checkboxes
+        water_checkbox.label_style = ft.TextStyle(size=12, color=pal["text_primary"], weight=ft.FontWeight.W_500)
+        water_checkbox.active_color = pal["accent"]
+        greenery_checkbox.label_style = ft.TextStyle(size=12, color=pal["text_primary"], weight=ft.FontWeight.W_500)
+        greenery_checkbox.active_color = pal["accent"]
+
+        # Update Form Fields & Dropdowns
+        for f in all_styled_fields:
+            f.bgcolor = pal["bg_input"]
+            f.color = pal["text_primary"]
+            f.border_color = pal["border_subtle"]
+            f.focused_border_color = pal["accent"]
+            f.cursor_color = pal["accent"]
+            f.label_style = ft.TextStyle(size=11, color=pal["text_secondary"])
+
+        for d in all_styled_dropdowns:
+            d.bgcolor = pal["bg_input"]
+            d.color = pal["text_primary"]
+            d.border_color = pal["border_subtle"]
+            d.focused_border_color = pal["accent"]
+
+        # Update Search button & Browse button
+        search_btn.icon_color = pal["accent"]
+        search_btn.style = ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8), bgcolor=pal["bg_input"])
+        browse_btn.icon_color = pal["accent"]
+
+        # Update Coverage Badge & Bounding Box Marker
+        coverage_icon.color = pal["accent"]
+        coverage_text.color = pal["accent"]
+        coverage_badge.bgcolor = ft.Colors.with_opacity(0.12, pal["accent"])
+        bbox_poly_marker.border_color = pal["accent"]
+        bbox_poly_marker.color = ft.Colors.with_opacity(0.18, pal["accent"])
+
+        # Update Generate button & progress
+        generate_btn.bgcolor = pal["accent"]
+        generate_btn.color = "#000000" if is_dark[0] else "#FFFFFF"
+        generate_btn.style = ft.ButtonStyle(
+            shape=ft.RoundedRectangleBorder(radius=10),
+            elevation=0, overlay_color=pal["accent_hover"],
+        )
+        progress_bar.color = pal["accent"]
+        progress_bar.bgcolor = pal["bg_input"]
+
+        # Refresh map polygon
+        if polygon_layer_ref.current:
+            polygon_layer_ref.current.polygons = [bbox_poly_marker]
+            polygon_layer_ref.current.update()
+
+        page.update()
+
+    theme_btn.on_click = toggle_theme
 
     # ── Generate Logic ─────────────────────────────────────────────
     def do_generate(e):
@@ -323,6 +709,8 @@ def main(page: ft.Page):
             status_icon.color = ERROR_RED
             status_text.value = "Invalid coordinate numbers."
             status_text.color = ERROR_RED
+            open_file_btn.visible = False
+            open_folder_btn.visible = False
             page.update()
             return
 
@@ -344,13 +732,16 @@ def main(page: ft.Page):
             desktop_path = os.path.expanduser("~")
 
         output_path = chosen_save_path[0] or os.path.join(desktop_path, fname)
+        last_generated_file[0] = output_path
 
         generate_btn.disabled = True
         progress_bar.visible = True
         progress_bar.value = 0
         status_icon.visible = False
+        open_file_btn.visible = False
+        open_folder_btn.visible = False
         status_text.value = "Contacting OpenStreetMap…"
-        status_text.color = TEXT_SECONDARY
+        status_text.color = current_theme()["text_secondary"]
         page.update()
 
         def on_progress(text, pct):
@@ -366,6 +757,10 @@ def main(page: ft.Page):
                 center_lat=lat, center_lon=lon,
                 scale=scale_val, paper_size=paper_val,
                 margin_mm=margin_mm, output_path=output_path,
+                include_water=bool(water_checkbox.value),
+                water_hex=water_color_field.value or "#C5DCE8",
+                include_greenery=bool(greenery_checkbox.value),
+                greenery_hex=greenery_color_field.value or "#DCE8D8",
                 on_progress=on_progress,
             )
 
@@ -375,9 +770,17 @@ def main(page: ft.Page):
                 status_icon.visible = True
                 status_icon.icon = ft.Icons.CHECK_CIRCLE_OUTLINE
                 status_icon.color = SUCCESS_GREEN
-                count_info = f" ({result.get('building_count', 0)} buildings)"
-                status_text.value = f"✓ Saved {os.path.basename(result['output_path'])}{count_info}"
+                
+                parts = [f"{result.get('building_count', 0)} bldgs"]
+                if water_checkbox.value and result.get('water_count', 0) > 0:
+                    parts.append(f"{result['water_count']} water")
+                if greenery_checkbox.value and result.get('greenery_count', 0) > 0:
+                    parts.append(f"{result['greenery_count']} parks")
+                
+                status_text.value = f"✓ {os.path.basename(result['output_path'])} ({', '.join(parts)})"
                 status_text.color = SUCCESS_GREEN
+                open_file_btn.visible = True
+                open_folder_btn.visible = True
             else:
                 progress_bar.visible = False
                 status_icon.visible = True
@@ -385,6 +788,8 @@ def main(page: ft.Page):
                 status_icon.color = ERROR_RED
                 status_text.value = result["message"]
                 status_text.color = ERROR_RED
+                open_file_btn.visible = False
+                open_folder_btn.visible = False
             try:
                 page.update()
             except Exception:
@@ -398,48 +803,66 @@ def main(page: ft.Page):
     sidebar = ft.Container(
         content=ft.Column(
             [
-                # Title
+                # Title + Theme Toggle
                 ft.Container(
-                    content=ft.Column([
+                    content=ft.Row([
                         ft.Row([
-                            ft.Icon(ft.Icons.GRID_ON_ROUNDED, color=ACCENT, size=22),
-                            ft.Text("Schwarzplan", size=20, weight=ft.FontWeight.W_700, color=TEXT_PRIMARY),
+                            app_icon,
+                            ft.Column([
+                                title_text,
+                                subtitle_text,
+                            ], spacing=1),
                         ], spacing=8),
-                        ft.Text("Architectural Figure-Ground Generator", size=11, color=TEXT_SECONDARY),
-                    ], spacing=2),
-                    padding=ft.Padding.only(bottom=14),
+                        ft.Container(expand=True),
+                        theme_btn,
+                    ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    padding=ft.Padding.only(bottom=12),
                 ),
-                ft.Divider(height=1, color=BORDER_SUBTLE),
+                div1,
 
                 # Location
-                ft.Container(height=6),
-                section_header("📍  Center Coordinates"),
+                ft.Container(height=4),
+                coords_header,
                 ft.Row([lat_field, lon_field], spacing=8),
 
-                ft.Container(height=10),
-                ft.Divider(height=1, color=BORDER_SUBTLE),
+                ft.Container(height=6),
+                div2,
 
-                # Settings
-                ft.Container(height=6),
-                section_header("⚙️  Scale & Format"),
-                label("Architectural Scale"),
+                # Scale & Paper Settings
+                ft.Container(height=4),
+                scale_header,
+                scale_label,
                 scale_dropdown,
-                ft.Container(height=6),
-                label("Paper Format & Orientation"),
+                ft.Container(height=4),
+                paper_label,
                 paper_dropdown,
-                ft.Container(height=6),
-                ft.Row([
-                    ft.Container(content=margin_field, expand=True),
-                    ft.Container(content=format_dropdown, expand=True),
-                ], spacing=8),
+                ft.Container(height=4),
+                ft.Row([margin_field, format_dropdown], spacing=8),
                 coverage_badge,
 
-                ft.Container(height=10),
-                ft.Divider(height=1, color=BORDER_SUBTLE),
+                ft.Container(height=6),
+                div3,
+
+                # Urban Context Layers (Water & Greenery)
+                ft.Container(height=4),
+                context_header,
+                ft.Row([
+                    ft.Container(content=water_checkbox, expand=True),
+                    water_color_box,
+                    water_color_field,
+                ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ft.Row([
+                    ft.Container(content=greenery_checkbox, expand=True),
+                    greenery_color_box,
+                    greenery_color_field,
+                ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+
+                ft.Container(height=6),
+                div4,
 
                 # Output
-                ft.Container(height=6),
-                section_header("📄  Save Output"),
+                ft.Container(height=4),
+                output_header,
                 ft.Row(
                     [ft.Container(content=filename_field, expand=True), browse_btn],
                     spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -454,46 +877,69 @@ def main(page: ft.Page):
                         progress_bar,
                         ft.Container(content=generate_btn, alignment=ft.Alignment.CENTER),
                         status_row,
-                    ], spacing=8, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-                    padding=ft.Padding.only(top=8),
+                    ], spacing=6, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                    padding=ft.Padding.only(top=6),
                 ),
             ],
             spacing=2,
             scroll=ft.ScrollMode.AUTO,
         ),
-        width=330,
-        bgcolor=BG_PANEL,
+        width=360,
+        bgcolor=initial_pal["bg_panel"],
         border_radius=ft.BorderRadius.only(top_right=16, bottom_right=16),
         padding=ft.Padding.all(18),
-        border=ft.Border.only(right=ft.BorderSide(1, BORDER_SUBTLE)),
+        border=ft.Border.only(right=ft.BorderSide(1, initial_pal["border_subtle"])),
+    )
+
+    # ── Map Container ──────────────────────────────────────────────
+    map_box = ft.Container(
+        content=the_map,
+        expand=True,
+        border_radius=12,
+        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+        border=ft.Border.all(1, initial_pal["border_subtle"]),
+    )
+
+    bottom_helper_icon = ft.Icon(ft.Icons.TOUCH_APP, size=13, color=initial_pal["text_secondary"])
+    bottom_helper_text = ft.Text("Click on the map to set center pin. Drag or pinch/scroll on trackpad to zoom & navigate.", size=11, color=initial_pal["text_secondary"])
+
+    map_view = ft.Container(
+        content=ft.Column([
+            # Clean Search Bar & Status
+            ft.Container(
+                content=ft.Row([
+                    search_input,
+                    search_btn,
+                    search_status,
+                ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                padding=ft.Padding.only(bottom=8),
+            ),
+            # Interactive Map with Live Bounding Box & Touchpad Zoom
+            map_box,
+            # Bottom Info Helper
+            ft.Container(
+                content=ft.Row([
+                    bottom_helper_icon,
+                    bottom_helper_text,
+                ], spacing=4),
+                padding=ft.Padding.only(top=6, left=4),
+            ),
+        ], spacing=0),
+        expand=True,
+        padding=ft.Padding.only(top=14, right=16, bottom=14, left=12),
     )
 
     # ── Main Layout ────────────────────────────────────────────────
     page.add(
         ft.Row(
-            [
-                sidebar,
-                ft.Container(
-                    content=ft.Column([
-                        ft.Container(
-                            content=ft.Text(
-                                "Click a location on the map, adjust scale or paper format, then generate.",
-                                size=12, color=TEXT_SECONDARY, italic=True,
-                            ),
-                            padding=ft.Padding.only(left=4, bottom=4),
-                        ),
-                        map_container,
-                    ], spacing=0),
-                    expand=True,
-                    padding=ft.Padding.only(top=14, right=16, bottom=14, left=12),
-                ),
-            ],
-            expand=True, spacing=0,
-        ),
+            [sidebar, map_view],
+            expand=True,
+            spacing=0,
+        )
     )
 
-    # Initialize coverage calculation
-    update_coverage_and_filename()
+    # Initialize coverage calculation & bounding box preview
+    update_coverage_and_preview()
 
 
 if __name__ == "__main__":
@@ -502,4 +948,8 @@ if __name__ == "__main__":
     except Exception as e:
         __log_crash(e)
         raise
+
+
+
+
 

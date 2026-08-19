@@ -30,7 +30,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Schwarzplan-macOS
-          path: build/macos/schwarzplan.app
+          path: build/macos/
 
   build-windows:
     runs-on: windows-latest

@@ -3,6 +3,7 @@ Schwarzplan (Figure-Ground Diagram) Generation Engine.
 
 Provides pure-Python spatial extraction and exact-scale architectural rendering:
 - Direct OpenStreetMap Overpass API extraction with automatic mirror fallbacks & caching
+- Multi-layer urban context: Buildings (Schwarzplan), Waterways (Blauplan), and Greenery/Parks (Grünplan)
 - Sub-millimeter accurate WGS84 Transverse Mercator metric projection
 - Exact-scale Vector PDF, SVG, and CAD DXF generation with courtyard (inner hole) cutouts
 - 100% pure Python with zero native C-extension dependencies (no GDAL, GEOS, PROJ.4 required)
@@ -44,13 +45,30 @@ SUPPORTED_FORMATS = [".pdf", ".svg", ".dxf"]
 # Overpass API Mirror Endpoints for High Availability
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+    "https://z.overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
-    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 ]
 
 # Standard conversion: 72 PostScript points per inch (25.4 mm)
 MM_TO_PT = 72.0 / 25.4
+
+
+def hex_to_rgb(hex_str: str) -> Tuple[float, float, float]:
+    """Converts a hex color code like #C5DCE8 to normalized (0.0-1.0) RGB float tuple."""
+    h = hex_str.strip().lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    if len(h) != 6:
+        return (0.0, 0.0, 0.0)
+    try:
+        r = int(h[0:2], 16) / 255.0
+        g = int(h[2:4], 16) / 255.0
+        b = int(h[4:6], 16) / 255.0
+        return (round(r, 3), round(g, 3), round(b, 3))
+    except Exception:
+        return (0.0, 0.0, 0.0)
 
 
 # ── Cache Management ────────────────────────────────────────────────
@@ -66,85 +84,150 @@ def _get_cache_dir() -> str:
         return temp_dir
 
 
-def _cache_key(lat: float, lon: float, radius: float) -> str:
-    key_str = f"{lat:.5f}_{lon:.5f}_{radius:.1f}"
+def _cache_key(lat: float, lon: float, radius: float, water: bool, greenery: bool) -> str:
+    key_str = f"{lat:.5f}_{lon:.5f}_{radius:.1f}_w{int(water)}_g{int(greenery)}"
     return hashlib.sha1(key_str.encode("utf-8")).hexdigest() + ".json"
 
 
 # ── Overpass API Fetcher ────────────────────────────────────────────
-def fetch_osm_buildings(
+def fetch_osm_layers(
     center_lat: float,
     center_lon: float,
     radius_m: float,
+    include_water: bool = False,
+    include_greenery: bool = False,
     on_progress: Optional[Callable[[str, float], None]] = None,
 ) -> Dict[str, Any]:
     """
-    Fetches raw OSM building footprints within radius_m of center_lat, center_lon.
-    Uses disk caching and falls back across multiple Overpass mirrors.
+    Fetches OSM building footprints, and optionally water and greenery layers.
     """
-    cache_path = os.path.join(_get_cache_dir(), _cache_key(center_lat, center_lon, radius_m))
+    cache_path = os.path.join(
+        _get_cache_dir(),
+        _cache_key(center_lat, center_lon, radius_m, include_water, include_greenery),
+    )
 
     if os.path.exists(cache_path):
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if on_progress:
-                    on_progress("Loaded buildings from local cache…", 0.3)
+                    on_progress("Loaded geometry from local cache…", 0.3)
                 return data
         except Exception:
             pass
 
     if on_progress:
-        on_progress(f"Querying OpenStreetMap (~{radius_m:.0f}m radius)…", 0.15)
+        layers_desc = ["Buildings"]
+        if include_water:
+            layers_desc.append("Water")
+        if include_greenery:
+            layers_desc.append("Greenery")
+        on_progress(f"Querying OpenStreetMap ({', '.join(layers_desc)}, ~{radius_m:.0f}m radius)…", 0.15)
 
-    overpass_query = f"""
-[out:json][timeout:30];
+    subqueries = [
+        f'way["building"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+        f'relation["building"]["type"="multipolygon"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+    ]
+
+    if include_water:
+        subqueries.extend([
+            f'way["natural"="water"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+            f'relation["natural"="water"]["type"="multipolygon"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+            f'way["waterway"~"riverbank|dock|canal|river"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+            f'relation["waterway"~"riverbank|dock|canal|river"]["type"="multipolygon"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+            f'way["water"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+            f'relation["water"]["type"="multipolygon"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+            f'way["landuse"~"basin|reservoir"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+        ])
+
+    if include_greenery:
+        subqueries.extend([
+            f'way["leisure"~"park|garden|pitch|recreation_ground"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+            f'relation["leisure"~"park|garden|pitch|recreation_ground"]["type"="multipolygon"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+            f'way["landuse"~"forest|grass|meadow|village_green|cemetery|allotments"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+            f'relation["landuse"~"forest|grass|meadow|village_green|cemetery|allotments"]["type"="multipolygon"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+            f'way["natural"="wood"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+            f'relation["natural"="wood"]["type"="multipolygon"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+        ])
+
+    overpass_query = f"""[out:json][timeout:50];
 (
-  way["building"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});
-  relation["building"]["type"="multipolygon"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});
+  {chr(10).join('  ' + q for q in subqueries)}
 );
 out body;
 >;
-out skel qt;
-"""
-    encoded_data = urllib.parse.urlencode({"data": overpass_query}).encode("utf-8")
-    headers = {
-        "User-Agent": "SchwarzplanApp/2.0 (Architectural Nolli Diagram Generator)",
-        "Accept": "application/json",
-    }
+out skel qt;"""
 
+    # 1. Try requests if available
     try:
-        import certifi
-        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
-    except Exception:
-        ssl_ctx = ssl.create_default_context()
-
-    last_error = None
-    for endpoint in OVERPASS_ENDPOINTS:
-        try:
-            req = urllib.request.Request(endpoint, data=encoded_data, headers=headers)
-            with urllib.request.urlopen(req, timeout=35, context=ssl_ctx) as resp:
-                if resp.status == 200:
-                    raw_content = resp.read().decode("utf-8")
-                    data = json.loads(raw_content)
+        import requests
+        for endpoint in OVERPASS_ENDPOINTS:
+            try:
+                resp = requests.post(
+                    endpoint,
+                    data={"data": overpass_query},
+                    headers={"User-Agent": "SchwarzplanApp/2.0"},
+                    timeout=40,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
                     try:
                         with open(cache_path, "w", encoding="utf-8") as cf:
                             json.dump(data, cf)
                     except Exception:
                         pass
                     return data
-        except Exception as err:
-            last_error = err
-            continue
+            except Exception:
+                continue
+    except ImportError:
+        pass
+
+    # 2. Fallback to urllib.request with robust SSL context
+    encoded_data = urllib.parse.urlencode({"data": overpass_query}).encode("utf-8")
+    headers = {
+        "User-Agent": "SchwarzplanApp/2.0",
+        "Accept": "*/*",
+    }
+
+    last_error = None
+    for endpoint in OVERPASS_ENDPOINTS:
+        for verify_ssl in [True, False]:
+            try:
+                if verify_ssl:
+                    try:
+                        import certifi
+                        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+                    except Exception:
+                        ssl_ctx = ssl.create_default_context()
+                else:
+                    ssl_ctx = ssl._create_unverified_context()
+
+                req = urllib.request.Request(endpoint, data=encoded_data, headers=headers)
+                with urllib.request.urlopen(req, timeout=40, context=ssl_ctx) as resp:
+                    if resp.status == 200:
+                        raw_content = resp.read().decode("utf-8")
+                        data = json.loads(raw_content)
+                        try:
+                            with open(cache_path, "w", encoding="utf-8") as cf:
+                                json.dump(data, cf)
+                        except Exception:
+                            pass
+                        return data
+            except Exception as err:
+                last_error = err
+                continue
 
     raise RuntimeError(f"All OpenStreetMap Overpass mirrors failed. Last error: {last_error}")
 
 
 # ── Geometry Parser ─────────────────────────────────────────────────
-def parse_building_polygons(osm_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+def parse_osm_layers(osm_data: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Extracts closed building polygons and handles multipolygon inner courtyards.
-    Returns a list of dicts: {'outer': [(lat, lon), ...], 'inners': [[(lat, lon), ...], ...]}
+    Extracts closed polygons for:
+    - 'buildings'
+    - 'water'
+    - 'greenery'
+    Handles multipolygon inner rings (courtyards/islands).
     """
     nodes: Dict[int, Tuple[float, float]] = {}
     ways: Dict[int, Dict[str, Any]] = {}
@@ -163,45 +246,85 @@ def parse_building_polygons(osm_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         elif el_type == "relation":
             relations.append(element)
 
-    polygons: List[Dict[str, Any]] = []
-    used_ways_in_relations = set()
+    def is_building(tags: Dict[str, str]) -> bool:
+        return "building" in tags
 
-    # 1. Process multipolygon relations (buildings with courtyards or composite parts)
+    def is_water(tags: Dict[str, str]) -> bool:
+        if tags.get("natural") == "water" or "waterway" in tags or "water" in tags:
+            return True
+        if tags.get("landuse") in ("basin", "reservoir"):
+            return True
+        return False
+
+    def is_greenery(tags: Dict[str, str]) -> bool:
+        if tags.get("leisure") in ("park", "garden", "pitch", "recreation_ground", "nature_reserve"):
+            return True
+        if tags.get("landuse") in ("forest", "grass", "meadow", "village_green", "cemetery", "allotments", "recreation_ground"):
+            return True
+        if tags.get("natural") in ("wood", "grassland", "scrub", "heath"):
+            return True
+        return False
+
+    buildings: List[Dict[str, Any]] = []
+    water: List[Dict[str, Any]] = []
+    greenery: List[Dict[str, Any]] = []
+    used_ways = set()
+
+    # 1. Process Relations
     for rel in relations:
         tags = rel.get("tags", {})
-        if tags.get("type") == "multipolygon" and "building" in tags:
-            outers: List[List[Tuple[float, float]]] = []
-            inners: List[List[Tuple[float, float]]] = []
-            for member in rel.get("members", []):
-                m_type = member.get("type")
-                m_ref = member.get("ref")
-                m_role = member.get("role", "outer")
-                if m_type == "way" and m_ref in ways:
-                    used_ways_in_relations.add(m_ref)
-                    way_node_coords = [
-                        nodes[nid] for nid in ways[m_ref]["nodes"] if nid in nodes
-                    ]
-                    if len(way_node_coords) >= 3:
-                        if m_role == "inner":
-                            inners.append(way_node_coords)
-                        else:
-                            outers.append(way_node_coords)
-            for outer in outers:
-                polygons.append({"outer": outer, "inners": inners})
+        if tags.get("type") == "multipolygon":
+            category = None
+            if is_building(tags):
+                category = buildings
+            elif is_water(tags):
+                category = water
+            elif is_greenery(tags):
+                category = greenery
 
-    # 2. Process independent building ways
+            if category is not None:
+                outers: List[List[Tuple[float, float]]] = []
+                inners: List[List[Tuple[float, float]]] = []
+                for member in rel.get("members", []):
+                    m_type = member.get("type")
+                    m_ref = member.get("ref")
+                    m_role = member.get("role", "outer")
+                    if m_type == "way" and m_ref in ways:
+                        used_ways.add(m_ref)
+                        coords = [nodes[nid] for nid in ways[m_ref]["nodes"] if nid in nodes]
+                        if len(coords) >= 3:
+                            if m_role == "inner":
+                                inners.append(coords)
+                            else:
+                                outers.append(coords)
+                for outer in outers:
+                    category.append({"outer": outer, "inners": inners})
+
+    # 2. Process Ways
     for way_id, way in ways.items():
-        if way_id in used_ways_in_relations:
+        if way_id in used_ways:
             continue
         tags = way.get("tags", {})
-        if "building" in tags:
-            way_node_ids = way.get("nodes", [])
-            if len(way_node_ids) >= 4 and way_node_ids[0] == way_node_ids[-1]:
-                pts = [nodes[nid] for nid in way_node_ids if nid in nodes]
-                if len(pts) >= 4:
-                    polygons.append({"outer": pts, "inners": []})
+        category = None
+        if is_building(tags):
+            category = buildings
+        elif is_water(tags):
+            category = water
+        elif is_greenery(tags):
+            category = greenery
 
-    return polygons
+        if category is not None:
+            node_ids = way.get("nodes", [])
+            if len(node_ids) >= 4 and node_ids[0] == node_ids[-1]:
+                pts = [nodes[nid] for nid in node_ids if nid in nodes]
+                if len(pts) >= 4:
+                    category.append({"outer": pts, "inners": []})
+
+    return {
+        "buildings": buildings,
+        "water": water,
+        "greenery": greenery,
+    }
 
 
 # ── Ellipsoidal Transverse Mercator Metric Projection ────────────────
@@ -213,8 +336,8 @@ def latlon_to_metric(
     relative to center_lat, center_lon using high-precision Transverse Mercator.
     Guarantees sub-millimeter precision for exact architectural scaling.
     """
-    a = 6378137.0  # WGS84 semi-major axis (meters)
-    f = 1 / 298.257223563  # WGS84 flattening
+    a = 6378137.0
+    f = 1 / 298.257223563
     b = a * (1 - f)
     e2 = (a**2 - b**2) / (a**2)
     e_prime2 = (a**2 - b**2) / (b**2)
@@ -232,7 +355,6 @@ def latlon_to_metric(
     C = e_prime2 * cos_lat**2
     A = (lon_rad - lon_origin_rad) * cos_lat
 
-    # Meridional distance on ellipsoid
     M = a * (
         (1 - e2 / 4 - 3 * e2**2 / 64 - 5 * e2**3 / 256) * lat_rad
         - (3 * e2 / 8 + 3 * e2**2 / 32 + 45 * e2**3 / 1024) * math.sin(2 * lat_rad)
@@ -251,7 +373,6 @@ def latlon_to_metric(
         + (61 - 58 * T + T**2 + 600 * C - 330 * e_prime2) * A**6 / 720
     )
 
-    # Origin offset
     lat0_rad = math.radians(center_lat)
     M0 = a * (
         (1 - e2 / 4 - 3 * e2**2 / 64 - 5 * e2**3 / 256) * lat0_rad
@@ -265,7 +386,7 @@ def latlon_to_metric(
 
 # ── Renderers ────────────────────────────────────────────────────────
 def render_pdf(
-    polygons: List[Dict[str, Any]],
+    layers: Dict[str, List[Dict[str, Any]]],
     center_lat: float,
     center_lon: float,
     paper_w_mm: float,
@@ -274,9 +395,13 @@ def render_pdf(
     real_w_m: float,
     real_h_m: float,
     output_path: str,
+    water_rgb: Tuple[float, float, float] = (0.77, 0.86, 0.91),
+    greenery_rgb: Tuple[float, float, float] = (0.86, 0.91, 0.85),
+    building_rgb: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    background_rgb: Tuple[float, float, float] = (1.0, 1.0, 1.0),
 ):
     """
-    Renders an exact-scale vector PDF with margin clipping and courtyard cutouts.
+    Renders an exact-scale multi-layer vector PDF.
     """
     paper_w_pt = paper_w_mm * MM_TO_PT
     paper_h_pt = paper_h_mm * MM_TO_PT
@@ -296,48 +421,52 @@ def render_pdf(
         return u, v
 
     pdf_cmds: List[str] = []
-    # Background white fill
-    pdf_cmds.append(f"1 1 1 rg 0 0 {paper_w_pt:.2f} {paper_h_pt:.2f} re f")
+    # 1. Background paper
+    br, bg, bb = background_rgb
+    pdf_cmds.append(f"{br:.3f} {bg:.3f} {bb:.3f} rg 0 0 {paper_w_pt:.2f} {paper_h_pt:.2f} re f")
 
-    # Save state & set clipping mask for exact margins
+    # 2. Clipping mask
     pdf_cmds.append("q")
     pdf_cmds.append(f"{margin_pt:.2f} {margin_pt:.2f} {map_w_pt:.2f} {map_h_pt:.2f} re W n")
 
-    # Set solid black fill
-    pdf_cmds.append("0 0 0 rg")
-
-    for poly in polygons:
-        path_tokens = []
-        # Outer ring
-        first = True
-        for lat, lon in poly["outer"]:
-            xm, ym = latlon_to_metric(lat, lon, center_lat, center_lon)
-            u, v = m_to_pt(xm, ym)
-            if first:
-                path_tokens.append(f"{u:.2f} {v:.2f} m")
-                first = False
-            else:
-                path_tokens.append(f"{u:.2f} {v:.2f} l")
-        path_tokens.append("h")
-
-        # Inner courtyard rings (holes)
-        for inner in poly.get("inners", []):
+    def draw_layer_polygons(polygons: List[Dict[str, Any]], color: Tuple[float, float, float]):
+        if not polygons:
+            return
+        cr, cg, cb = color
+        pdf_cmds.append(f"{cr:.3f} {cg:.3f} {cb:.3f} rg")
+        for poly in polygons:
+            path_tokens = []
             first = True
-            for lat, lon in inner:
+            for lat, lon in poly["outer"]:
                 xm, ym = latlon_to_metric(lat, lon, center_lat, center_lon)
                 u, v = m_to_pt(xm, ym)
-                if first:
-                    path_tokens.append(f"{u:.2f} {v:.2f} m")
-                    first = False
-                else:
-                    path_tokens.append(f"{u:.2f} {v:.2f} l")
+                path_tokens.append(f"{u:.2f} {v:.2f} {'m' if first else 'l'}")
+                first = False
             path_tokens.append("h")
 
-        # Fill with even-odd winding rule to cleanly subtract courtyards
-        path_tokens.append("f*")
-        pdf_cmds.append(" ".join(path_tokens))
+            for inner in poly.get("inners", []):
+                first = True
+                for lat, lon in inner:
+                    xm, ym = latlon_to_metric(lat, lon, center_lat, center_lon)
+                    u, v = m_to_pt(xm, ym)
+                    path_tokens.append(f"{u:.2f} {v:.2f} {'m' if first else 'l'}")
+                    first = False
+                path_tokens.append("h")
 
-    pdf_cmds.append("Q")  # Restore state
+            path_tokens.append("f*")
+            pdf_cmds.append(" ".join(path_tokens))
+
+    # Layer order: Water -> Greenery -> Buildings on top
+    draw_layer_polygons(layers.get("water", []), water_rgb)
+    draw_layer_polygons(layers.get("greenery", []), greenery_rgb)
+    draw_layer_polygons(layers.get("buildings", []), building_rgb)
+
+    # 3. Outer border frame
+    pdf_cmds.append(f"{building_rgb[0]:.3f} {building_rgb[1]:.3f} {building_rgb[2]:.3f} RG")
+    pdf_cmds.append("0.5 w")
+    pdf_cmds.append(f"{margin_pt:.2f} {margin_pt:.2f} {map_w_pt:.2f} {map_h_pt:.2f} re S")
+
+    pdf_cmds.append("Q")
 
     content_stream = "\n".join(pdf_cmds).encode("utf-8")
     stream_len = len(content_stream)
@@ -377,7 +506,7 @@ def render_pdf(
 
 
 def render_svg(
-    polygons: List[Dict[str, Any]],
+    layers: Dict[str, List[Dict[str, Any]]],
     center_lat: float,
     center_lon: float,
     paper_w_mm: float,
@@ -386,9 +515,13 @@ def render_svg(
     real_w_m: float,
     real_h_m: float,
     output_path: str,
+    water_hex: str = "#C5DCE8",
+    greenery_hex: str = "#DCE8D8",
+    building_hex: str = "#000000",
+    background_hex: str = "#FFFFFF",
 ):
     """
-    Renders an exact-scale vector SVG formatted with physical millimeter dimensions.
+    Renders an exact-scale multi-layer SVG with organized vector layers for Illustrator/Figma.
     """
     map_w_mm = paper_w_mm - 2 * margin_mm
     map_h_mm = paper_h_mm - 2 * margin_mm
@@ -397,7 +530,6 @@ def render_svg(
     y_min = -real_h_m / 2.0
 
     def m_to_svg(xm: float, ym: float) -> Tuple[float, float]:
-        # SVG y-axis points downwards, invert y
         u = margin_mm + ((xm - x_min) / real_w_m) * map_w_mm
         v = paper_h_mm - (margin_mm + ((ym - y_min) / real_h_m) * map_h_mm)
         return u, v
@@ -411,33 +543,45 @@ def render_svg(
         f'      <rect x="{margin_mm:.2f}" y="{margin_mm:.2f}" width="{map_w_mm:.2f}" height="{map_h_mm:.2f}" />',
         '    </clipPath>',
         '  </defs>',
-        f'  <rect width="{paper_w_mm:.2f}" height="{paper_h_mm:.2f}" fill="#FFFFFF" />',
-        '  <g clip-path="url(#map-clip)" fill="#000000" fill-rule="evenodd">',
+        f'  <rect width="{paper_w_mm:.2f}" height="{paper_h_mm:.2f}" fill="{background_hex}" />',
     ]
 
-    for poly in polygons:
-        path_parts = []
-        first = True
-        for lat, lon in poly["outer"]:
-            xm, ym = latlon_to_metric(lat, lon, center_lat, center_lon)
-            u, v = m_to_svg(xm, ym)
-            path_parts.append(f"{'M' if first else 'L'} {u:.3f} {v:.3f}")
-            first = False
-        path_parts.append("Z")
-
-        for inner in poly.get("inners", []):
+    def render_layer(layer_id: str, polygons: List[Dict[str, Any]], fill_hex: str):
+        if not polygons:
+            return
+        svg_lines.append(f'  <g id="{layer_id}" clip-path="url(#map-clip)" fill="{fill_hex}" fill-rule="evenodd">')
+        for poly in polygons:
+            path_parts = []
             first = True
-            for lat, lon in inner:
+            for lat, lon in poly["outer"]:
                 xm, ym = latlon_to_metric(lat, lon, center_lat, center_lon)
                 u, v = m_to_svg(xm, ym)
                 path_parts.append(f"{'M' if first else 'L'} {u:.3f} {v:.3f}")
                 first = False
             path_parts.append("Z")
 
-        d_str = " ".join(path_parts)
-        svg_lines.append(f'    <path d="{d_str}" />')
+            for inner in poly.get("inners", []):
+                first = True
+                for lat, lon in inner:
+                    xm, ym = latlon_to_metric(lat, lon, center_lat, center_lon)
+                    u, v = m_to_svg(xm, ym)
+                    path_parts.append(f"{'M' if first else 'L'} {u:.3f} {v:.3f}")
+                    first = False
+                path_parts.append("Z")
 
-    svg_lines.append('  </g>')
+            d_str = " ".join(path_parts)
+            svg_lines.append(f'    <path d="{d_str}" />')
+        svg_lines.append('  </g>')
+
+    render_layer("water_layer", layers.get("water", []), water_hex)
+    render_layer("greenery_layer", layers.get("greenery", []), greenery_hex)
+    render_layer("buildings_layer", layers.get("buildings", []), building_hex)
+
+    # Frame border
+    svg_lines.append(
+        f'  <rect x="{margin_mm:.2f}" y="{margin_mm:.2f}" width="{map_w_mm:.2f}" height="{map_h_mm:.2f}" '
+        f'fill="none" stroke="{building_hex}" stroke-width="0.3" />'
+    )
     svg_lines.append('</svg>')
 
     with open(output_path, "w", encoding="utf-8") as f:
@@ -445,13 +589,13 @@ def render_svg(
 
 
 def render_dxf(
-    polygons: List[Dict[str, Any]],
+    layers: Dict[str, List[Dict[str, Any]]],
     center_lat: float,
     center_lon: float,
     output_path: str,
 ):
     """
-    Renders an AutoCAD-compatible DXF file containing 1:1 real-world building polylines in meters.
+    Renders an AutoCAD-compatible DXF with organized layers: BUILDINGS, WATER, GREENERY.
     """
     dxf_lines = [
         "0", "SECTION",
@@ -465,11 +609,21 @@ def render_dxf(
         "2", "TABLES",
         "0", "TABLE",
         "2", "LAYER",
-        "70", "1",
+        "70", "3",
         "0", "LAYER",
         "2", "BUILDINGS",
         "70", "0",
         "62", "7",  # White/Black
+        "6", "CONTINUOUS",
+        "0", "LAYER",
+        "2", "WATER",
+        "70", "0",
+        "62", "140",  # Cyan-Blue
+        "6", "CONTINUOUS",
+        "0", "LAYER",
+        "2", "GREENERY",
+        "70", "0",
+        "62", "70",  # Green
         "6", "CONTINUOUS",
         "0", "ENDTAB",
         "0", "ENDSEC",
@@ -477,36 +631,35 @@ def render_dxf(
         "2", "ENTITIES",
     ]
 
-    for poly in polygons:
-        # Outer ring
-        outer = poly["outer"]
-        if len(outer) >= 3:
-            dxf_lines.extend([
-                "0", "LWPOLYLINE",
-                "100", "AcDbEntity",
-                "8", "BUILDINGS",
-                "100", "AcDbPolyline",
-                "90", str(len(outer)),
-                "70", "1",  # 1 = Closed
-            ])
-            for lat, lon in outer:
-                xm, ym = latlon_to_metric(lat, lon, center_lat, center_lon)
-                dxf_lines.extend(["10", f"{xm:.3f}", "20", f"{ym:.3f}"])
-
-        # Inner rings
-        for inner in poly.get("inners", []):
-            if len(inner) >= 3:
+    for layer_name, layer_key in [("WATER", "water"), ("GREENERY", "greenery"), ("BUILDINGS", "buildings")]:
+        for poly in layers.get(layer_key, []):
+            outer = poly["outer"]
+            if len(outer) >= 3:
                 dxf_lines.extend([
                     "0", "LWPOLYLINE",
                     "100", "AcDbEntity",
-                    "8", "BUILDINGS",
+                    "8", layer_name,
                     "100", "AcDbPolyline",
-                    "90", str(len(inner)),
+                    "90", str(len(outer)),
                     "70", "1",
                 ])
-                for lat, lon in inner:
+                for lat, lon in outer:
                     xm, ym = latlon_to_metric(lat, lon, center_lat, center_lon)
                     dxf_lines.extend(["10", f"{xm:.3f}", "20", f"{ym:.3f}"])
+
+            for inner in poly.get("inners", []):
+                if len(inner) >= 3:
+                    dxf_lines.extend([
+                        "0", "LWPOLYLINE",
+                        "100", "AcDbEntity",
+                        "8", layer_name,
+                        "100", "AcDbPolyline",
+                        "90", str(len(inner)),
+                        "70", "1",
+                    ])
+                    for lat, lon in inner:
+                        xm, ym = latlon_to_metric(lat, lon, center_lat, center_lon)
+                        dxf_lines.extend(["10", f"{xm:.3f}", "20", f"{ym:.3f}"])
 
     dxf_lines.extend(["0", "ENDSEC", "0", "EOF"])
 
@@ -522,29 +675,21 @@ def generate_schwarzplan(
     paper_size: str = "A3 Landscape",
     margin_mm: float = 15.0,
     output_path: str = "schwarzplan.pdf",
+    include_water: bool = False,
+    water_hex: str = "#C5DCE8",
+    include_greenery: bool = False,
+    greenery_hex: str = "#DCE8D8",
+    building_hex: str = "#000000",
+    background_hex: str = "#FFFFFF",
     on_progress: Optional[Callable[[str, float], None]] = None,
 ) -> Dict[str, Any]:
     """
-    Generates an exact-scale Schwarzplan (figure-ground diagram) in PDF, SVG, or DXF format.
-
-    Args:
-        center_lat: Latitude of the center point (-90 to 90).
-        center_lon: Longitude of the center point (-180 to 180).
-        scale: Architectural scale denominator (e.g. 1000 for 1:1000).
-        paper_size: Key from PAPER_SIZES dict.
-        margin_mm: Border in millimeters on all sides.
-        output_path: Destination file path (.pdf, .svg, or .dxf).
-        on_progress: Callback for progress updates (text: str, pct: float 0.0-1.0).
-
-    Returns:
-        Dict with keys: success (bool), message (str), output_path (str | None),
-        building_count (int), coverage_w_m (float), coverage_h_m (float).
+    Generates an exact-scale Schwarzplan with optional Water and Greenery context layers.
     """
     def _prog(txt: str, p: float = -1.0):
         if on_progress:
             on_progress(txt, p)
 
-    # 1. Validation
     if paper_size not in PAPER_SIZES:
         return {
             "success": False,
@@ -573,17 +718,19 @@ def generate_schwarzplan(
             "output_path": None,
         }
 
-    # Real-world metric dimensions
     real_w_m = (map_w_mm / 1000.0) * scale
     real_h_m = (map_h_mm / 1000.0) * scale
-
-    # Buffer radius to ensure complete edge polygons
     query_radius_m = (max(real_w_m, real_h_m) / 2.0) * 1.15
 
-    # 2. Fetch OpenStreetMap Buildings
+    # 1. Fetch OSM Layers
     try:
-        osm_data = fetch_osm_buildings(
-            center_lat, center_lon, query_radius_m, on_progress=_prog
+        osm_data = fetch_osm_layers(
+            center_lat,
+            center_lon,
+            query_radius_m,
+            include_water=include_water,
+            include_greenery=include_greenery,
+            on_progress=_prog,
         )
     except Exception as e:
         return {
@@ -592,24 +739,30 @@ def generate_schwarzplan(
             "output_path": None,
         }
 
-    # 3. Parse Polygons
-    _prog("Parsing building geometries…", 0.45)
-    polygons = parse_building_polygons(osm_data)
+    # 2. Parse Polygons into Layers
+    _prog("Parsing urban geometry layers…", 0.50)
+    layers = parse_osm_layers(osm_data)
 
-    if not polygons:
+    if not layers["buildings"] and not layers["water"] and not layers["greenery"]:
         return {
             "success": False,
-            "message": "No building polygons found in this region.",
+            "message": "No building or urban context features found in this region.",
             "output_path": None,
         }
 
-    # 4. Render Target Format
+    # 3. Render Output
     ext = os.path.splitext(output_path)[1].lower()
     if ext not in SUPPORTED_FORMATS:
         ext = ".pdf"
         output_path += ".pdf"
 
-    _prog(f"Rendering {ext.upper()[1:]} ({len(polygons)} buildings)…", 0.75)
+    counts_str = f"{len(layers['buildings'])} buildings"
+    if include_water and layers["water"]:
+        counts_str += f", {len(layers['water'])} waterbodies"
+    if include_greenery and layers["greenery"]:
+        counts_str += f", {len(layers['greenery'])} parks"
+
+    _prog(f"Rendering {ext.upper()[1:]} ({counts_str})…", 0.75)
 
     try:
         out_dir = os.path.dirname(os.path.abspath(output_path))
@@ -618,7 +771,7 @@ def generate_schwarzplan(
 
         if ext == ".pdf":
             render_pdf(
-                polygons,
+                layers,
                 center_lat,
                 center_lon,
                 paper_w_mm,
@@ -627,10 +780,14 @@ def generate_schwarzplan(
                 real_w_m,
                 real_h_m,
                 output_path,
+                water_rgb=hex_to_rgb(water_hex),
+                greenery_rgb=hex_to_rgb(greenery_hex),
+                building_rgb=hex_to_rgb(building_hex),
+                background_rgb=hex_to_rgb(background_hex),
             )
         elif ext == ".svg":
             render_svg(
-                polygons,
+                layers,
                 center_lat,
                 center_lon,
                 paper_w_mm,
@@ -639,10 +796,14 @@ def generate_schwarzplan(
                 real_w_m,
                 real_h_m,
                 output_path,
+                water_hex=water_hex,
+                greenery_hex=greenery_hex,
+                building_hex=building_hex,
+                background_hex=background_hex,
             )
         elif ext == ".dxf":
             render_dxf(
-                polygons,
+                layers,
                 center_lat,
                 center_lon,
                 output_path,
@@ -653,7 +814,9 @@ def generate_schwarzplan(
             "success": True,
             "message": f"Successfully generated {os.path.basename(output_path)}",
             "output_path": output_path,
-            "building_count": len(polygons),
+            "building_count": len(layers["buildings"]),
+            "water_count": len(layers["water"]),
+            "greenery_count": len(layers["greenery"]),
             "coverage_w_m": real_w_m,
             "coverage_h_m": real_h_m,
         }

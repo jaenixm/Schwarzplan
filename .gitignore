@@ -23,8 +23,14 @@ env/
 ehthumbs.db
 Thumbs.db
 
-# Generated PDF plans
+# Generated output plans
 *.pdf
+*.svg
+*.dxf
+
+# OSM Response Cache
+src/cache/
+cache/
 
 # IDEs
 .idea/
