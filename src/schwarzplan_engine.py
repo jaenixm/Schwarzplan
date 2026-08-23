@@ -84,8 +84,8 @@ def _get_cache_dir() -> str:
         return temp_dir
 
 
-def _cache_key(lat: float, lon: float, radius: float, water: bool, greenery: bool) -> str:
-    key_str = f"{lat:.5f}_{lon:.5f}_{radius:.1f}_w{int(water)}_g{int(greenery)}"
+def _cache_key(lat: float, lon: float, radius: float, buildings: bool, water: bool, greenery: bool) -> str:
+    key_str = f"{lat:.5f}_{lon:.5f}_{radius:.1f}_b{int(buildings)}_w{int(water)}_g{int(greenery)}"
     return hashlib.sha1(key_str.encode("utf-8")).hexdigest() + ".json"
 
 
@@ -94,16 +94,17 @@ def fetch_osm_layers(
     center_lat: float,
     center_lon: float,
     radius_m: float,
+    include_buildings: bool = True,
     include_water: bool = False,
     include_greenery: bool = False,
     on_progress: Optional[Callable[[str, float], None]] = None,
 ) -> Dict[str, Any]:
     """
-    Fetches OSM building footprints, and optionally water and greenery layers.
+    Fetches OSM layers: buildings, waterbodies, and/or greenery.
     """
     cache_path = os.path.join(
         _get_cache_dir(),
-        _cache_key(center_lat, center_lon, radius_m, include_water, include_greenery),
+        _cache_key(center_lat, center_lon, radius_m, include_buildings, include_water, include_greenery),
     )
 
     if os.path.exists(cache_path):
@@ -117,17 +118,21 @@ def fetch_osm_layers(
             pass
 
     if on_progress:
-        layers_desc = ["Buildings"]
+        layers_desc = []
+        if include_buildings:
+            layers_desc.append("Buildings")
         if include_water:
             layers_desc.append("Water")
         if include_greenery:
             layers_desc.append("Greenery")
         on_progress(f"Querying OpenStreetMap ({', '.join(layers_desc)}, ~{radius_m:.0f}m radius)…", 0.15)
 
-    subqueries = [
-        f'way["building"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
-        f'relation["building"]["type"="multipolygon"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
-    ]
+    subqueries = []
+    if include_buildings:
+        subqueries.extend([
+            f'way["building"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+            f'relation["building"]["type"="multipolygon"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+        ])
 
     if include_water:
         subqueries.extend([
@@ -149,6 +154,9 @@ def fetch_osm_layers(
             f'way["natural"="wood"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
             f'relation["natural"="wood"]["type"="multipolygon"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
         ])
+
+    if not subqueries:
+        return {"elements": []}
 
     overpass_query = f"""[out:json][timeout:50];
 (
@@ -462,7 +470,8 @@ def render_pdf(
     draw_layer_polygons(layers.get("buildings", []), building_rgb)
 
     # 3. Outer border frame
-    pdf_cmds.append(f"{building_rgb[0]:.3f} {building_rgb[1]:.3f} {building_rgb[2]:.3f} RG")
+    fr, fg, fb = (0.0, 0.0, 0.0) if background_rgb[0] > 0.5 else (1.0, 1.0, 1.0)
+    pdf_cmds.append(f"{fr:.3f} {fg:.3f} {fb:.3f} RG")
     pdf_cmds.append("0.5 w")
     pdf_cmds.append(f"{margin_pt:.2f} {margin_pt:.2f} {map_w_pt:.2f} {map_h_pt:.2f} re S")
 
@@ -578,9 +587,10 @@ def render_svg(
     render_layer("buildings_layer", layers.get("buildings", []), building_hex)
 
     # Frame border
+    border_color = "#000000" if background_hex.upper() in ("#FFFFFF", "#FFF", "#F4F6F8") else "#FFFFFF"
     svg_lines.append(
         f'  <rect x="{margin_mm:.2f}" y="{margin_mm:.2f}" width="{map_w_mm:.2f}" height="{map_h_mm:.2f}" '
-        f'fill="none" stroke="{building_hex}" stroke-width="0.3" />'
+        f'fill="none" stroke="{border_color}" stroke-width="0.3" />'
     )
     svg_lines.append('</svg>')
 
@@ -675,20 +685,28 @@ def generate_schwarzplan(
     paper_size: str = "A3 Landscape",
     margin_mm: float = 15.0,
     output_path: str = "schwarzplan.pdf",
+    include_buildings: bool = True,
+    building_hex: str = "#000000",
     include_water: bool = False,
     water_hex: str = "#C5DCE8",
     include_greenery: bool = False,
     greenery_hex: str = "#DCE8D8",
-    building_hex: str = "#000000",
     background_hex: str = "#FFFFFF",
     on_progress: Optional[Callable[[str, float], None]] = None,
 ) -> Dict[str, Any]:
     """
-    Generates an exact-scale Schwarzplan with optional Water and Greenery context layers.
+    Generates an exact-scale plan with selectable Buildings, Water, and Greenery layers.
     """
     def _prog(txt: str, p: float = -1.0):
         if on_progress:
             on_progress(txt, p)
+
+    if not include_buildings and not include_water and not include_greenery:
+        return {
+            "success": False,
+            "message": "Please enable at least one layer (Buildings, Water, or Greenery).",
+            "output_path": None,
+        }
 
     if paper_size not in PAPER_SIZES:
         return {
@@ -728,6 +746,7 @@ def generate_schwarzplan(
             center_lat,
             center_lon,
             query_radius_m,
+            include_buildings=include_buildings,
             include_water=include_water,
             include_greenery=include_greenery,
             on_progress=_prog,
@@ -743,10 +762,11 @@ def generate_schwarzplan(
     _prog("Parsing urban geometry layers…", 0.50)
     layers = parse_osm_layers(osm_data)
 
-    if not layers["buildings"] and not layers["water"] and not layers["greenery"]:
+    total_features = len(layers["buildings"]) + len(layers["water"]) + len(layers["greenery"])
+    if total_features == 0:
         return {
             "success": False,
-            "message": "No building or urban context features found in this region.",
+            "message": "No features found in this region for the selected layers.",
             "output_path": None,
         }
 
@@ -756,13 +776,15 @@ def generate_schwarzplan(
         ext = ".pdf"
         output_path += ".pdf"
 
-    counts_str = f"{len(layers['buildings'])} buildings"
-    if include_water and layers["water"]:
-        counts_str += f", {len(layers['water'])} waterbodies"
-    if include_greenery and layers["greenery"]:
-        counts_str += f", {len(layers['greenery'])} parks"
+    counts_list = []
+    if include_buildings:
+        counts_list.append(f"{len(layers['buildings'])} buildings")
+    if include_water:
+        counts_list.append(f"{len(layers['water'])} water")
+    if include_greenery:
+        counts_list.append(f"{len(layers['greenery'])} parks")
 
-    _prog(f"Rendering {ext.upper()[1:]} ({counts_str})…", 0.75)
+    _prog(f"Rendering {ext.upper()[1:]} ({', '.join(counts_list)})…", 0.75)
 
     try:
         out_dir = os.path.dirname(os.path.abspath(output_path))

@@ -226,9 +226,37 @@ def main(page: ft.Page):
     )
     filename_field = styled_text_field(value="schwarzplan_a3_1_1000.pdf", label="Filename")
 
-    # ── Urban Context Layers (Water & Greenery) ────────────────────
+    # ── Urban Context Layers (Buildings, Water, Greenery) ──────────
+    building_color_val = ["#000000" if not is_dark[0] else "#F0F0F0"]
     water_color_val = ["#C5DCE8" if not is_dark[0] else "#1E2D3D"]
     greenery_color_val = ["#DCE8D8" if not is_dark[0] else "#203324"]
+
+    building_checkbox = ft.Checkbox(
+        label="Buildings (Schwarzplan)",
+        value=True,
+        label_style=ft.TextStyle(size=12, color=initial_pal["text_primary"], weight=ft.FontWeight.W_500),
+        active_color=initial_pal["accent"],
+    )
+    building_color_box = ft.Container(
+        width=20, height=20, border_radius=4,
+        bgcolor=building_color_val[0],
+        border=ft.Border.all(1, initial_pal["border_subtle"]),
+    )
+    building_color_field = styled_text_field(
+        value=building_color_val[0],
+        label="Bldg Hex",
+        width=100,
+        height=40,
+    )
+
+    def on_building_color_change(e):
+        hex_val = building_color_field.value.strip()
+        if len(hex_val) == 7 and hex_val.startswith("#"):
+            building_color_val[0] = hex_val
+            building_color_box.bgcolor = hex_val
+            page.update()
+
+    building_color_field.on_change = on_building_color_change
 
     water_checkbox = ft.Checkbox(
         label="Waterways (Blauplan)",
@@ -327,7 +355,22 @@ def main(page: ft.Page):
 
             if chosen_save_path[0] is None:
                 safe_paper = paper_key.lower().replace(" ", "_").replace("×", "x")
-                filename_field.value = f"schwarzplan_{safe_paper}_1_{scale_val}.{fmt_ext}"
+                b = bool(building_checkbox.value)
+                w = bool(water_checkbox.value)
+                g = bool(greenery_checkbox.value)
+                if b and not w and not g:
+                    prefix = "schwarzplan"
+                elif not b and w and not g:
+                    prefix = "blauplan"
+                elif not b and not w and g:
+                    prefix = "gruenplan"
+                elif not b and w and g:
+                    prefix = "freiraumplan"
+                elif b and (w or g):
+                    prefix = "schwarzplan_context"
+                else:
+                    prefix = "plan"
+                filename_field.value = f"{prefix}_{safe_paper}_1_{scale_val}.{fmt_ext}"
 
             bbox_poly_marker.coordinates = coords
             if polygon_layer_ref.current:
@@ -355,6 +398,9 @@ def main(page: ft.Page):
     format_dropdown.on_change = update_coverage_and_preview
     margin_field.on_change = update_coverage_and_preview
     margin_field.on_blur = update_coverage_and_preview
+    building_checkbox.on_change = update_coverage_and_preview
+    water_checkbox.on_change = update_coverage_and_preview
+    greenery_checkbox.on_change = update_coverage_and_preview
 
     # ── Coordinates manual edit handler ────────────────────────────
     def on_coords_changed(e=None):
@@ -459,7 +505,7 @@ def main(page: ft.Page):
         content=ft.Row(
             [
                 ft.Icon(ft.Icons.AUTO_AWESOME, size=18),
-                ft.Text("Generate Schwarzplan", size=14, weight=ft.FontWeight.W_600),
+                ft.Text("Generate Plan", size=14, weight=ft.FontWeight.W_600),
             ],
             alignment=ft.MainAxisAlignment.CENTER, spacing=8,
         ),
@@ -599,7 +645,10 @@ def main(page: ft.Page):
         style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8), bgcolor=initial_pal["bg_input"]),
     )
 
-    all_styled_fields = [lat_field, lon_field, margin_field, filename_field, search_input, water_color_field, greenery_color_field]
+    all_styled_fields = [
+        lat_field, lon_field, margin_field, filename_field, search_input,
+        building_color_field, water_color_field, greenery_color_field,
+    ]
     all_styled_dropdowns = [scale_dropdown, paper_dropdown, format_dropdown]
 
     def toggle_theme(e):
@@ -647,6 +696,8 @@ def main(page: ft.Page):
         div4.color = pal["border_subtle"]
 
         # Update checkboxes
+        building_checkbox.label_style = ft.TextStyle(size=12, color=pal["text_primary"], weight=ft.FontWeight.W_500)
+        building_checkbox.active_color = pal["accent"]
         water_checkbox.label_style = ft.TextStyle(size=12, color=pal["text_primary"], weight=ft.FontWeight.W_500)
         water_checkbox.active_color = pal["accent"]
         greenery_checkbox.label_style = ft.TextStyle(size=12, color=pal["text_primary"], weight=ft.FontWeight.W_500)
@@ -714,6 +765,21 @@ def main(page: ft.Page):
             page.update()
             return
 
+        inc_b = bool(building_checkbox.value)
+        inc_w = bool(water_checkbox.value)
+        inc_g = bool(greenery_checkbox.value)
+
+        if not inc_b and not inc_w and not inc_g:
+            status_icon.visible = True
+            status_icon.icon = ft.Icons.ERROR_OUTLINE
+            status_icon.color = ERROR_RED
+            status_text.value = "Please select at least one layer to export."
+            status_text.color = ERROR_RED
+            open_file_btn.visible = False
+            open_folder_btn.visible = False
+            page.update()
+            return
+
         try:
             margin_mm = float(margin_field.value)
         except (ValueError, TypeError):
@@ -723,7 +789,7 @@ def main(page: ft.Page):
         paper_val = paper_dropdown.value
         fmt_val = format_dropdown.value or "pdf"
 
-        fname = filename_field.value or f"schwarzplan.{fmt_val}"
+        fname = filename_field.value or f"plan.{fmt_val}"
         if not any(fname.lower().endswith(ext) for ext in SUPPORTED_FORMATS):
             fname = f"{fname}.{fmt_val}"
 
@@ -757,10 +823,13 @@ def main(page: ft.Page):
                 center_lat=lat, center_lon=lon,
                 scale=scale_val, paper_size=paper_val,
                 margin_mm=margin_mm, output_path=output_path,
-                include_water=bool(water_checkbox.value),
+                include_buildings=inc_b,
+                building_hex=building_color_field.value or ("#000000" if not is_dark[0] else "#FFFFFF"),
+                include_water=inc_w,
                 water_hex=water_color_field.value or "#C5DCE8",
-                include_greenery=bool(greenery_checkbox.value),
+                include_greenery=inc_g,
                 greenery_hex=greenery_color_field.value or "#DCE8D8",
+                background_hex="#FFFFFF" if not is_dark[0] else "#0D0D0D",
                 on_progress=on_progress,
             )
 
@@ -771,11 +840,13 @@ def main(page: ft.Page):
                 status_icon.icon = ft.Icons.CHECK_CIRCLE_OUTLINE
                 status_icon.color = SUCCESS_GREEN
                 
-                parts = [f"{result.get('building_count', 0)} bldgs"]
-                if water_checkbox.value and result.get('water_count', 0) > 0:
-                    parts.append(f"{result['water_count']} water")
-                if greenery_checkbox.value and result.get('greenery_count', 0) > 0:
-                    parts.append(f"{result['greenery_count']} parks")
+                parts = []
+                if inc_b:
+                    parts.append(f"{result.get('building_count', 0)} bldgs")
+                if inc_w:
+                    parts.append(f"{result.get('water_count', 0)} water")
+                if inc_g:
+                    parts.append(f"{result.get('greenery_count', 0)} parks")
                 
                 status_text.value = f"✓ {os.path.basename(result['output_path'])} ({', '.join(parts)})"
                 status_text.color = SUCCESS_GREEN
@@ -843,9 +914,14 @@ def main(page: ft.Page):
                 ft.Container(height=6),
                 div3,
 
-                # Urban Context Layers (Water & Greenery)
+                # Urban Context Layers (Buildings, Water & Greenery)
                 ft.Container(height=4),
                 context_header,
+                ft.Row([
+                    ft.Container(content=building_checkbox, expand=True),
+                    building_color_box,
+                    building_color_field,
+                ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ft.Row([
                     ft.Container(content=water_checkbox, expand=True),
                     water_color_box,
