@@ -2,14 +2,21 @@
 name = "schwarzplan"
 version = "1.0.0"
 description = "Generate architectural figure-ground diagrams (Schwarzplan) from OpenStreetMap data"
+readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
-    "flet>=0.25.0",
-    "flet-map>=0.2.0",
-    "certifi>=2024.0.0",
+    # Flet makes breaking API changes between minor releases and this app uses
+    # the 0.84 API, so both Flet packages are pinned exactly.
+    "flet==0.84.0",
+    "flet-map==0.84.0",
+    "certifi>=2024.7.4",
 ]
 
 [tool.flet]
+# Names the built bundle: Schwarzplan.app and Schwarzplan.exe. Without this the
+# lowercase project name is used, which the install instructions do not match.
+artifact = "Schwarzplan"
 product = "Schwarzplan Generator"
 org = "com.schwarzplan"
 company = "Schwarzplan"
@@ -18,4 +25,3 @@ copyright = "Copyright 2026"
 [tool.flet.app]
 path = "src"
 module = "main"
-

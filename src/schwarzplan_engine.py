@@ -3,7 +3,7 @@ Schwarzplan (Figure-Ground Diagram) Generation Engine.
 
 Provides pure-Python spatial extraction and exact-scale architectural rendering:
 - Direct OpenStreetMap Overpass API extraction with automatic mirror fallbacks & caching
-- Multi-layer urban context: Buildings (Schwarzplan), Waterways (Blauplan), and Greenery/Parks (Grünplan)
+- Multi-layer urban context: Buildings (Schwarzplan), Waterways (Blauplan), Greenery/Parks (Grünplan), and Roadways (Verkehrsplan)
 - Sub-millimeter accurate WGS84 Transverse Mercator metric projection
 - Exact-scale Vector PDF, SVG, and CAD DXF generation with courtyard (inner hole) cutouts
 - 100% pure Python with zero native C-extension dependencies (no GDAL, GEOS, PROJ.4 required)
@@ -11,8 +11,10 @@ Provides pure-Python spatial extraction and exact-scale architectural rendering:
 
 import os
 import ssl
+import sys
 import json
 import math
+import time
 import hashlib
 import tempfile
 import urllib.request
@@ -54,28 +56,76 @@ OVERPASS_ENDPOINTS = [
 # Standard conversion: 72 PostScript points per inch (25.4 mm)
 MM_TO_PT = 72.0 / 25.4
 
+# Nominatim and Overpass both require a User-Agent that identifies the app and
+# gives them a way to make contact. Requests without one get blocked.
+APP_VERSION = "1.0.0"
+CONTACT_URL = "https://github.com/jaenixm/Schwarzplan"
+USER_AGENT = f"SchwarzplanGenerator/{APP_VERSION} ({CONTACT_URL})"
 
-def hex_to_rgb(hex_str: str) -> Tuple[float, float, float]:
-    """Converts a hex color code like #C5DCE8 to normalized (0.0-1.0) RGB float tuple."""
-    h = hex_str.strip().lstrip("#")
+# OpenStreetMap data is ODbL-licensed and requires attribution on derived works.
+OSM_ATTRIBUTION = "Map data \u00a9 OpenStreetMap contributors (ODbL)"
+
+# Cached Overpass responses older than this are refetched, so plans do not show
+# a city as it was months ago.
+CACHE_TTL_SECONDS = 14 * 24 * 3600
+
+# Above this radius an Overpass query for every building reliably times out.
+MAX_QUERY_RADIUS_M = 6000.0
+
+
+def normalize_hex(value: Optional[str]) -> Optional[str]:
+    """
+    Returns a color as '#RRGGBB', or None if it cannot be read.
+
+    Accepts '#C5DCE8', 'c5dce8' and the 3-digit '#abc' shorthand. Callers use
+    the None to keep a half-typed color out of an export.
+    """
+    if not value:
+        return None
+    h = value.strip().lstrip("#")
     if len(h) == 3:
         h = "".join(c * 2 for c in h)
     if len(h) != 6:
-        return (0.0, 0.0, 0.0)
-    try:
-        r = int(h[0:2], 16) / 255.0
-        g = int(h[2:4], 16) / 255.0
-        b = int(h[4:6], 16) / 255.0
-        return (round(r, 3), round(g, 3), round(b, 3))
-    except Exception:
-        return (0.0, 0.0, 0.0)
+        return None
+    # int(h, 16) is too permissive here: it accepts signs and underscores, so
+    # "+12345" would pass and produce the unusable colour "#+12345".
+    if any(c not in "0123456789abcdefABCDEF" for c in h):
+        return None
+    return "#" + h.upper()
+
+
+def hex_to_rgb(hex_str: str, fallback: Tuple[float, float, float] = (0.0, 0.0, 0.0)) -> Tuple[float, float, float]:
+    """Converts a hex color code like #C5DCE8 to a normalized (0.0-1.0) RGB tuple."""
+    normalized = normalize_hex(hex_str)
+    if normalized is None:
+        return fallback
+    h = normalized.lstrip("#")
+    return (
+        round(int(h[0:2], 16) / 255.0, 3),
+        round(int(h[2:4], 16) / 255.0, 3),
+        round(int(h[4:6], 16) / 255.0, 3),
+    )
 
 
 # ── Cache Management ────────────────────────────────────────────────
 def _get_cache_dir() -> str:
-    """Returns directory path for caching raw OSM responses."""
+    """
+    Returns a user-writable directory for caching raw OSM responses.
+
+    This must never be next to __file__: in a packaged app that path is inside
+    the read-only, code-signed application bundle.
+    """
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        base_dir = os.path.join(home, "Library", "Caches", "Schwarzplan")
+    elif sys.platform == "win32":
+        root = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        base_dir = os.path.join(root, "Schwarzplan", "Cache")
+    else:
+        root = os.environ.get("XDG_CACHE_HOME") or os.path.join(home, ".cache")
+        base_dir = os.path.join(root, "schwarzplan")
+
     try:
-        base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
         os.makedirs(base_dir, exist_ok=True)
         return base_dir
     except Exception:
@@ -84,9 +134,58 @@ def _get_cache_dir() -> str:
         return temp_dir
 
 
-def _cache_key(lat: float, lon: float, radius: float, buildings: bool, water: bool, greenery: bool) -> str:
-    key_str = f"{lat:.5f}_{lon:.5f}_{radius:.1f}_b{int(buildings)}_w{int(water)}_g{int(greenery)}"
+def _cache_key(lat: float, lon: float, radius: float, buildings: bool, water: bool, greenery: bool, roads: bool = False) -> str:
+    key_str = f"{lat:.5f}_{lon:.5f}_{radius:.1f}_b{int(buildings)}_w{int(water)}_g{int(greenery)}_r{int(roads)}"
     return hashlib.sha1(key_str.encode("utf-8")).hexdigest() + ".json"
+
+
+def _response_problem(data: Any) -> Optional[str]:
+    """
+    Returns a message if this Overpass response must not be used or cached.
+
+    Overpass answers a timed-out or overloaded query with HTTP 200, an empty
+    element list and a "remark" field. Caching that would make the failure
+    permanent for this location.
+    """
+    if not isinstance(data, dict):
+        return "The map server sent an unreadable response."
+    remark = data.get("remark")
+    if remark:
+        text = str(remark)
+        if "timed out" in text.lower():
+            return (
+                "The map server timed out. Try a smaller paper size or a larger "
+                "scale number, then generate again."
+            )
+        return f"The map server reported: {text}"
+    if not data.get("elements"):
+        return None  # Genuinely empty area; the caller reports it, we just do not cache it.
+    return None
+
+
+def _read_cache(cache_path: str) -> Optional[Dict[str, Any]]:
+    """Returns a cached response, or None if it is missing, stale or unusable."""
+    try:
+        if time.time() - os.path.getmtime(cache_path) > CACHE_TTL_SECONDS:
+            return None
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if _response_problem(data) is not None or not data.get("elements"):
+        return None
+    return data
+
+
+def _write_cache(cache_path: str, data: Dict[str, Any]) -> None:
+    """Stores a response, but only one that is actually worth reusing."""
+    if _response_problem(data) is not None or not data.get("elements"):
+        return
+    try:
+        with open(cache_path, "w", encoding="utf-8") as cf:
+            json.dump(data, cf)
+    except Exception:
+        pass
 
 
 # ── Overpass API Fetcher ────────────────────────────────────────────
@@ -97,25 +196,22 @@ def fetch_osm_layers(
     include_buildings: bool = True,
     include_water: bool = False,
     include_greenery: bool = False,
+    include_roads: bool = False,
     on_progress: Optional[Callable[[str, float], None]] = None,
 ) -> Dict[str, Any]:
     """
-    Fetches OSM layers: buildings, waterbodies, and/or greenery.
+    Fetches OSM layers: buildings, waterbodies, greenery, and/or roadways.
     """
     cache_path = os.path.join(
         _get_cache_dir(),
-        _cache_key(center_lat, center_lon, radius_m, include_buildings, include_water, include_greenery),
+        _cache_key(center_lat, center_lon, radius_m, include_buildings, include_water, include_greenery, include_roads),
     )
 
-    if os.path.exists(cache_path):
-        try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if on_progress:
-                    on_progress("Loaded geometry from local cache…", 0.3)
-                return data
-        except Exception:
-            pass
+    cached = _read_cache(cache_path)
+    if cached is not None:
+        if on_progress:
+            on_progress("Loaded geometry from local cache…", 0.3)
+        return cached
 
     if on_progress:
         layers_desc = []
@@ -125,6 +221,8 @@ def fetch_osm_layers(
             layers_desc.append("Water")
         if include_greenery:
             layers_desc.append("Greenery")
+        if include_roads:
+            layers_desc.append("Roadways")
         on_progress(f"Querying OpenStreetMap ({', '.join(layers_desc)}, ~{radius_m:.0f}m radius)…", 0.15)
 
     subqueries = []
@@ -155,6 +253,12 @@ def fetch_osm_layers(
             f'relation["natural"="wood"]["type"="multipolygon"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
         ])
 
+    if include_roads:
+        subqueries.extend([
+            f'way["highway"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+            f'relation["highway"]["type"="multipolygon"](around:{radius_m:.1f},{center_lat:.6f},{center_lon:.6f});',
+        ])
+
     if not subqueries:
         return {"elements": []}
 
@@ -166,75 +270,154 @@ out body;
 >;
 out skel qt;"""
 
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    last_error: Optional[str] = None
+
     # 1. Try requests if available
     try:
         import requests
+    except ImportError:
+        requests = None
+
+    if requests is not None:
         for endpoint in OVERPASS_ENDPOINTS:
             try:
                 resp = requests.post(
-                    endpoint,
-                    data={"data": overpass_query},
-                    headers={"User-Agent": "SchwarzplanApp/2.0"},
-                    timeout=40,
+                    endpoint, data={"data": overpass_query}, headers=headers, timeout=60
                 )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    try:
-                        with open(cache_path, "w", encoding="utf-8") as cf:
-                            json.dump(data, cf)
-                    except Exception:
-                        pass
-                    return data
-            except Exception:
-                continue
-    except ImportError:
-        pass
-
-    # 2. Fallback to urllib.request with robust SSL context
-    encoded_data = urllib.parse.urlencode({"data": overpass_query}).encode("utf-8")
-    headers = {
-        "User-Agent": "SchwarzplanApp/2.0",
-        "Accept": "*/*",
-    }
-
-    last_error = None
-    for endpoint in OVERPASS_ENDPOINTS:
-        for verify_ssl in [True, False]:
-            try:
-                if verify_ssl:
-                    try:
-                        import certifi
-                        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
-                    except Exception:
-                        ssl_ctx = ssl.create_default_context()
-                else:
-                    ssl_ctx = ssl._create_unverified_context()
-
-                req = urllib.request.Request(endpoint, data=encoded_data, headers=headers)
-                with urllib.request.urlopen(req, timeout=40, context=ssl_ctx) as resp:
-                    if resp.status == 200:
-                        raw_content = resp.read().decode("utf-8")
-                        data = json.loads(raw_content)
-                        try:
-                            with open(cache_path, "w", encoding="utf-8") as cf:
-                                json.dump(data, cf)
-                        except Exception:
-                            pass
-                        return data
+                if resp.status_code != 200:
+                    last_error = f"HTTP {resp.status_code}"
+                    continue
+                data = resp.json()
             except Exception as err:
-                last_error = err
+                last_error = str(err)
                 continue
+            problem = _response_problem(data)
+            if problem is not None:
+                last_error = problem
+                continue
+            _write_cache(cache_path, data)
+            return data
 
-    raise RuntimeError(f"All OpenStreetMap Overpass mirrors failed. Last error: {last_error}")
+        # requests already tried every mirror; repeating them over urllib would
+        # only double the wait before the error reaches the user.
+        raise RuntimeError(last_error or "Could not reach any OpenStreetMap server.")
+
+    # 2. Fallback to urllib.request. Certificates are always verified: a plan is
+    #    not worth handing an attacker a foothold for.
+    encoded_data = urllib.parse.urlencode({"data": overpass_query}).encode("utf-8")
+    try:
+        import certifi
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        ssl_ctx = ssl.create_default_context()
+
+    for endpoint in OVERPASS_ENDPOINTS:
+        try:
+            req = urllib.request.Request(endpoint, data=encoded_data, headers=headers)
+            with urllib.request.urlopen(req, timeout=60, context=ssl_ctx) as resp:
+                if resp.status != 200:
+                    last_error = f"HTTP {resp.status}"
+                    continue
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as err:
+            last_error = str(err)
+            continue
+        problem = _response_problem(data)
+        if problem is not None:
+            last_error = problem
+            continue
+        _write_cache(cache_path, data)
+        return data
+
+    raise RuntimeError(last_error or "Could not reach any OpenStreetMap server.")
+
+
+# ── Ring Assembly ───────────────────────────────────────────────────
+def _stitch_rings(fragments: List[List[Tuple[float, float]]]) -> List[List[Tuple[float, float]]]:
+    """
+    Joins way fragments end-to-end into closed rings.
+
+    OpenStreetMap splits a large outer ring across several ways, so a single
+    member way is usually an open fragment. Treating each fragment as its own
+    closed ring cuts a chord straight across the shape.
+    """
+    rings: List[List[Tuple[float, float]]] = []
+    pending = [list(f) for f in fragments if len(f) >= 2]
+
+    while pending:
+        ring = pending.pop(0)
+        joined = True
+        while joined and ring[0] != ring[-1]:
+            joined = False
+            for i, frag in enumerate(pending):
+                if frag[0] == ring[-1]:
+                    ring = ring + frag[1:]
+                elif frag[-1] == ring[-1]:
+                    ring = ring + frag[-2::-1]
+                elif frag[-1] == ring[0]:
+                    ring = frag[:-1] + ring
+                elif frag[0] == ring[0]:
+                    ring = frag[:0:-1] + ring
+                else:
+                    continue
+                pending.pop(i)
+                joined = True
+                break
+
+        if len(ring) < 3:
+            continue
+        if ring[0] != ring[-1]:
+            ring = ring + [ring[0]]  # Data gap: close it so the area still renders.
+        if len(ring) >= 4:
+            rings.append(ring)
+
+    return rings
+
+
+def _point_in_ring(point: Tuple[float, float], ring: List[Tuple[float, float]]) -> bool:
+    """Ray-casting containment test, used to match courtyards to their building."""
+    px, py = point
+    inside = False
+    j = len(ring) - 1
+    for i in range(len(ring)):
+        xi, yi = ring[i]
+        xj, yj = ring[j]
+        if (yi > py) != (yj > py) and px < (xj - xi) * (py - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _build_polygons(
+    outer_fragments: List[List[Tuple[float, float]]],
+    inner_fragments: List[List[Tuple[float, float]]],
+) -> List[Dict[str, Any]]:
+    """Assembles a multipolygon, giving each hole to the ring that contains it."""
+    outers = _stitch_rings(outer_fragments)
+    inners = _stitch_rings(inner_fragments)
+    if not outers:
+        return []
+    if len(outers) == 1:
+        return [{"outer": outers[0], "inners": inners}]
+
+    polygons = [{"outer": o, "inners": []} for o in outers]
+    for inner in inners:
+        for poly in polygons:
+            if _point_in_ring(inner[0], poly["outer"]):
+                poly["inners"].append(inner)
+                break
+    return polygons
 
 
 # ── Geometry Parser ─────────────────────────────────────────────────
 def parse_osm_layers(osm_data: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Extracts closed polygons for:
-    - 'buildings'
-    - 'water'
-    - 'greenery'
+    Extracts geometric features for:
+    - 'buildings' (polygons)
+    - 'water' (polygons)
+    - 'greenery' (polygons)
+    - 'roads' (polylines/polygons)
     Handles multipolygon inner rings (courtyards/islands).
     """
     nodes: Dict[int, Tuple[float, float]] = {}
@@ -245,7 +428,9 @@ def parse_osm_layers(osm_data: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]
         el_type = element.get("type")
         el_id = element.get("id")
         if el_type == "node":
-            nodes[el_id] = (element.get("lat"), element.get("lon"))
+            lat, lon = element.get("lat"), element.get("lon")
+            if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                nodes[el_id] = (lat, lon)
         elif el_type == "way":
             ways[el_id] = {
                 "nodes": element.get("nodes", []),
@@ -273,9 +458,18 @@ def parse_osm_layers(osm_data: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]
             return True
         return False
 
+    def is_roadway(tags: Dict[str, str]) -> bool:
+        hw = tags.get("highway")
+        if not hw:
+            return False
+        if hw in ("proposed", "abandoned", "razed", "demolished", "platform", "raceway", "corridor", "elevator", "escalator"):
+            return False
+        return True
+
     buildings: List[Dict[str, Any]] = []
     water: List[Dict[str, Any]] = []
     greenery: List[Dict[str, Any]] = []
+    roads: List[Dict[str, Any]] = []
     used_ways = set()
 
     # 1. Process Relations
@@ -289,49 +483,72 @@ def parse_osm_layers(osm_data: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]
                 category = water
             elif is_greenery(tags):
                 category = greenery
+            elif is_roadway(tags):
+                category = roads
 
             if category is not None:
-                outers: List[List[Tuple[float, float]]] = []
-                inners: List[List[Tuple[float, float]]] = []
+                outer_parts: List[List[Tuple[float, float]]] = []
+                inner_parts: List[List[Tuple[float, float]]] = []
                 for member in rel.get("members", []):
-                    m_type = member.get("type")
                     m_ref = member.get("ref")
-                    m_role = member.get("role", "outer")
-                    if m_type == "way" and m_ref in ways:
-                        used_ways.add(m_ref)
-                        coords = [nodes[nid] for nid in ways[m_ref]["nodes"] if nid in nodes]
-                        if len(coords) >= 3:
-                            if m_role == "inner":
-                                inners.append(coords)
-                            else:
-                                outers.append(coords)
-                for outer in outers:
-                    category.append({"outer": outer, "inners": inners})
+                    if member.get("type") != "way" or m_ref not in ways:
+                        continue
+                    used_ways.add(m_ref)
+                    coords = [nodes[nid] for nid in ways[m_ref]["nodes"] if nid in nodes]
+                    if len(coords) >= 2:
+                        if member.get("role") == "inner":
+                            inner_parts.append(coords)
+                        else:
+                            outer_parts.append(coords)
+
+                if category is roads:
+                    hw = tags.get("highway", "pedestrian")
+                    for ring in _stitch_rings(outer_parts) + _stitch_rings(inner_parts):
+                        roads.append({"points": ring, "highway": hw, "is_area": True})
+                else:
+                    category.extend(_build_polygons(outer_parts, inner_parts))
 
     # 2. Process Ways
     for way_id, way in ways.items():
         if way_id in used_ways:
             continue
         tags = way.get("tags", {})
-        category = None
         if is_building(tags):
-            category = buildings
-        elif is_water(tags):
-            category = water
-        elif is_greenery(tags):
-            category = greenery
-
-        if category is not None:
             node_ids = way.get("nodes", [])
             if len(node_ids) >= 4 and node_ids[0] == node_ids[-1]:
                 pts = [nodes[nid] for nid in node_ids if nid in nodes]
                 if len(pts) >= 4:
-                    category.append({"outer": pts, "inners": []})
+                    buildings.append({"outer": pts, "inners": []})
+        elif is_water(tags):
+            node_ids = way.get("nodes", [])
+            if len(node_ids) >= 4 and node_ids[0] == node_ids[-1]:
+                pts = [nodes[nid] for nid in node_ids if nid in nodes]
+                if len(pts) >= 4:
+                    water.append({"outer": pts, "inners": []})
+        elif is_greenery(tags):
+            node_ids = way.get("nodes", [])
+            if len(node_ids) >= 4 and node_ids[0] == node_ids[-1]:
+                pts = [nodes[nid] for nid in node_ids if nid in nodes]
+                if len(pts) >= 4:
+                    greenery.append({"outer": pts, "inners": []})
+        elif is_roadway(tags):
+            node_ids = way.get("nodes", [])
+            if len(node_ids) >= 2:
+                pts = [nodes[nid] for nid in node_ids if nid in nodes]
+                if len(pts) >= 2:
+                    is_area = (len(pts) >= 4 and pts[0] == pts[-1] and tags.get("area") == "yes")
+                    roads.append({
+                        "points": pts,
+                        "highway": tags.get("highway", "residential"),
+                        "name": tags.get("name", ""),
+                        "is_area": is_area,
+                    })
 
     return {
         "buildings": buildings,
         "water": water,
         "greenery": greenery,
+        "roads": roads,
     }
 
 
@@ -405,6 +622,7 @@ def render_pdf(
     output_path: str,
     water_rgb: Tuple[float, float, float] = (0.77, 0.86, 0.91),
     greenery_rgb: Tuple[float, float, float] = (0.86, 0.91, 0.85),
+    road_rgb: Tuple[float, float, float] = (0.60, 0.60, 0.60),
     building_rgb: Tuple[float, float, float] = (0.0, 0.0, 0.0),
     background_rgb: Tuple[float, float, float] = (1.0, 1.0, 1.0),
 ):
@@ -464,9 +682,44 @@ def render_pdf(
             path_tokens.append("f*")
             pdf_cmds.append(" ".join(path_tokens))
 
-    # Layer order: Water -> Greenery -> Buildings on top
+    def draw_roads(roads: List[Dict[str, Any]], color: Tuple[float, float, float]):
+        if not roads:
+            return
+        rr, rg, rb = color
+        pdf_cmds.append(f"{rr:.3f} {rg:.3f} {rb:.3f} RG")
+        pdf_cmds.append("1 J 1 j")  # round cap, round join
+
+        for road in roads:
+            pts = road.get("points", [])
+            if len(pts) < 2:
+                continue
+            hw = road.get("highway", "")
+            if hw in ("motorway", "motorway_link", "trunk", "trunk_link"):
+                lw = 1.1
+            elif hw in ("primary", "primary_link", "secondary", "secondary_link"):
+                lw = 0.8
+            elif hw in ("tertiary", "tertiary_link", "unclassified", "residential", "living_street"):
+                lw = 0.55
+            elif hw in ("service", "pedestrian", "track", "busway"):
+                lw = 0.4
+            else:
+                lw = 0.3
+
+            pdf_cmds.append(f"{lw:.2f} w")
+            path_tokens = []
+            first = True
+            for lat, lon in pts:
+                xm, ym = latlon_to_metric(lat, lon, center_lat, center_lon)
+                u, v = m_to_pt(xm, ym)
+                path_tokens.append(f"{u:.2f} {v:.2f} {'m' if first else 'l'}")
+                first = False
+            path_tokens.append("S")
+            pdf_cmds.append(" ".join(path_tokens))
+
+    # Layer order: Water -> Greenery -> Roadways -> Buildings on top
     draw_layer_polygons(layers.get("water", []), water_rgb)
     draw_layer_polygons(layers.get("greenery", []), greenery_rgb)
+    draw_roads(layers.get("roads", []), road_rgb)
     draw_layer_polygons(layers.get("buildings", []), building_rgb)
 
     # 3. Outer border frame
@@ -477,7 +730,22 @@ def render_pdf(
 
     pdf_cmds.append("Q")
 
-    content_stream = "\n".join(pdf_cmds).encode("utf-8")
+    # 4. ODbL attribution. Sits in the margin, below the frame.
+    label_pt = 6.0
+    label_y = margin_pt - label_pt - 2.0
+    if label_y < 2.0:
+        label_y = margin_pt + 3.0  # Margin too tight: place it just inside the frame.
+    escaped = (
+        OSM_ATTRIBUTION.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    )
+    pdf_cmds.append("BT")
+    pdf_cmds.append(f"/F1 {label_pt:.1f} Tf")
+    pdf_cmds.append(f"{fr:.3f} {fg:.3f} {fb:.3f} rg")
+    pdf_cmds.append(f"{margin_pt:.2f} {label_y:.2f} Td")
+    pdf_cmds.append(f"({escaped}) Tj")
+    pdf_cmds.append("ET")
+
+    content_stream = "\n".join(pdf_cmds).encode("latin-1", "replace")
     stream_len = len(content_stream)
 
     pdf_objects = [
@@ -485,11 +753,12 @@ def render_pdf(
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
         (
             f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {paper_w_pt:.2f} {paper_h_pt:.2f}] "
-            f"/Contents 4 0 R /Resources << >> >>"
+            f"/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>"
         ).encode("utf-8"),
         f"<< /Length {stream_len} >>\nstream\n".encode("utf-8")
         + content_stream
         + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
     ]
 
     out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
@@ -526,6 +795,7 @@ def render_svg(
     output_path: str,
     water_hex: str = "#C5DCE8",
     greenery_hex: str = "#DCE8D8",
+    road_hex: str = "#A0A0A0",
     building_hex: str = "#000000",
     background_hex: str = "#FFFFFF",
 ):
@@ -582,8 +852,41 @@ def render_svg(
             svg_lines.append(f'    <path d="{d_str}" />')
         svg_lines.append('  </g>')
 
+    def render_roads_layer(layer_id: str, roads: List[Dict[str, Any]], stroke_hex: str):
+        if not roads:
+            return
+        svg_lines.append(f'  <g id="{layer_id}" clip-path="url(#map-clip)" fill="none" stroke="{stroke_hex}" stroke-linecap="round" stroke-linejoin="round">')
+        for road in roads:
+            pts = road.get("points", [])
+            if len(pts) < 2:
+                continue
+            hw = road.get("highway", "")
+            if hw in ("motorway", "motorway_link", "trunk", "trunk_link"):
+                lw_mm = 0.38
+            elif hw in ("primary", "primary_link", "secondary", "secondary_link"):
+                lw_mm = 0.28
+            elif hw in ("tertiary", "tertiary_link", "unclassified", "residential", "living_street"):
+                lw_mm = 0.20
+            elif hw in ("service", "pedestrian", "track", "busway"):
+                lw_mm = 0.14
+            else:
+                lw_mm = 0.10
+
+            path_parts = []
+            first = True
+            for lat, lon in pts:
+                xm, ym = latlon_to_metric(lat, lon, center_lat, center_lon)
+                u, v = m_to_svg(xm, ym)
+                path_parts.append(f"{'M' if first else 'L'} {u:.3f} {v:.3f}")
+                first = False
+
+            d_str = " ".join(path_parts)
+            svg_lines.append(f'    <path d="{d_str}" stroke-width="{lw_mm:.3f}" />')
+        svg_lines.append('  </g>')
+
     render_layer("water_layer", layers.get("water", []), water_hex)
     render_layer("greenery_layer", layers.get("greenery", []), greenery_hex)
+    render_roads_layer("roadways_layer", layers.get("roads", []), road_hex)
     render_layer("buildings_layer", layers.get("buildings", []), building_hex)
 
     # Frame border
@@ -591,6 +894,11 @@ def render_svg(
     svg_lines.append(
         f'  <rect x="{margin_mm:.2f}" y="{margin_mm:.2f}" width="{map_w_mm:.2f}" height="{map_h_mm:.2f}" '
         f'fill="none" stroke="{border_color}" stroke-width="0.3" />'
+    )
+    label_y = margin_mm - 2.0 if margin_mm >= 5.0 else paper_h_mm - 2.0
+    svg_lines.append(
+        f'  <text x="{margin_mm:.2f}" y="{label_y:.2f}" font-family="Helvetica, Arial, sans-serif" '
+        f'font-size="2.1" fill="{border_color}">{OSM_ATTRIBUTION}</text>'
     )
     svg_lines.append('</svg>')
 
@@ -605,9 +913,10 @@ def render_dxf(
     output_path: str,
 ):
     """
-    Renders an AutoCAD-compatible DXF with organized layers: BUILDINGS, WATER, GREENERY.
+    Renders an AutoCAD-compatible DXF with organized layers: BUILDINGS, WATER, GREENERY, ROADWAYS.
     """
     dxf_lines = [
+        "999", OSM_ATTRIBUTION,
         "0", "SECTION",
         "2", "HEADER",
         "9", "$ACADVER",
@@ -619,7 +928,7 @@ def render_dxf(
         "2", "TABLES",
         "0", "TABLE",
         "2", "LAYER",
-        "70", "3",
+        "70", "4",
         "0", "LAYER",
         "2", "BUILDINGS",
         "70", "0",
@@ -634,6 +943,11 @@ def render_dxf(
         "2", "GREENERY",
         "70", "0",
         "62", "70",  # Green
+        "6", "CONTINUOUS",
+        "0", "LAYER",
+        "2", "ROADWAYS",
+        "70", "0",
+        "62", "8",  # Gray
         "6", "CONTINUOUS",
         "0", "ENDTAB",
         "0", "ENDSEC",
@@ -671,6 +985,22 @@ def render_dxf(
                         xm, ym = latlon_to_metric(lat, lon, center_lat, center_lon)
                         dxf_lines.extend(["10", f"{xm:.3f}", "20", f"{ym:.3f}"])
 
+    for road in layers.get("roads", []):
+        pts = road.get("points", [])
+        if len(pts) >= 2:
+            is_closed = "1" if (len(pts) >= 4 and pts[0] == pts[-1]) else "0"
+            dxf_lines.extend([
+                "0", "LWPOLYLINE",
+                "100", "AcDbEntity",
+                "8", "ROADWAYS",
+                "100", "AcDbPolyline",
+                "90", str(len(pts)),
+                "70", is_closed,
+            ])
+            for lat, lon in pts:
+                xm, ym = latlon_to_metric(lat, lon, center_lat, center_lon)
+                dxf_lines.extend(["10", f"{xm:.3f}", "20", f"{ym:.3f}"])
+
     dxf_lines.extend(["0", "ENDSEC", "0", "EOF"])
 
     with open(output_path, "w", encoding="utf-8") as f:
@@ -691,20 +1021,22 @@ def generate_schwarzplan(
     water_hex: str = "#C5DCE8",
     include_greenery: bool = False,
     greenery_hex: str = "#DCE8D8",
+    include_roads: bool = False,
+    road_hex: str = "#A0A0A0",
     background_hex: str = "#FFFFFF",
     on_progress: Optional[Callable[[str, float], None]] = None,
 ) -> Dict[str, Any]:
     """
-    Generates an exact-scale plan with selectable Buildings, Water, and Greenery layers.
+    Generates an exact-scale plan with selectable Buildings, Water, Greenery, and Roadways layers.
     """
     def _prog(txt: str, p: float = -1.0):
         if on_progress:
             on_progress(txt, p)
 
-    if not include_buildings and not include_water and not include_greenery:
+    if not include_buildings and not include_water and not include_greenery and not include_roads:
         return {
             "success": False,
-            "message": "Please enable at least one layer (Buildings, Water, or Greenery).",
+            "message": "Please enable at least one layer (Buildings, Water, Greenery, or Roadways).",
             "output_path": None,
         }
 
@@ -726,19 +1058,38 @@ def generate_schwarzplan(
     paper_w_mm = paper["width_mm"]
     paper_h_mm = paper["height_mm"]
 
+    if margin_mm < 0:
+        return {
+            "success": False,
+            "message": "Border must be zero or more.",
+            "output_path": None,
+        }
+
     map_w_mm = paper_w_mm - 2 * margin_mm
     map_h_mm = paper_h_mm - 2 * margin_mm
 
     if map_w_mm <= 0 or map_h_mm <= 0:
         return {
             "success": False,
-            "message": "Margin is too large for the selected paper format.",
+            "message": "Border is too large for the selected paper format.",
             "output_path": None,
         }
 
     real_w_m = (map_w_mm / 1000.0) * scale
     real_h_m = (map_h_mm / 1000.0) * scale
     query_radius_m = (max(real_w_m, real_h_m) / 2.0) * 1.15
+
+    if query_radius_m > MAX_QUERY_RADIUS_M:
+        area_km = max(real_w_m, real_h_m) / 1000.0
+        return {
+            "success": False,
+            "message": (
+                f"This covers {area_km:.1f} km across, which is more than the map "
+                f"server will return. Choose a smaller paper size or a scale below "
+                f"1:{scale}."
+            ),
+            "output_path": None,
+        }
 
     # 1. Fetch OSM Layers
     try:
@@ -749,6 +1100,7 @@ def generate_schwarzplan(
             include_buildings=include_buildings,
             include_water=include_water,
             include_greenery=include_greenery,
+            include_roads=include_roads,
             on_progress=_prog,
         )
     except Exception as e:
@@ -762,7 +1114,12 @@ def generate_schwarzplan(
     _prog("Parsing urban geometry layers…", 0.50)
     layers = parse_osm_layers(osm_data)
 
-    total_features = len(layers["buildings"]) + len(layers["water"]) + len(layers["greenery"])
+    total_features = (
+        len(layers["buildings"])
+        + len(layers["water"])
+        + len(layers["greenery"])
+        + len(layers["roads"])
+    )
     if total_features == 0:
         return {
             "success": False,
@@ -783,6 +1140,8 @@ def generate_schwarzplan(
         counts_list.append(f"{len(layers['water'])} water")
     if include_greenery:
         counts_list.append(f"{len(layers['greenery'])} parks")
+    if include_roads:
+        counts_list.append(f"{len(layers['roads'])} roads")
 
     _prog(f"Rendering {ext.upper()[1:]} ({', '.join(counts_list)})…", 0.75)
 
@@ -802,10 +1161,11 @@ def generate_schwarzplan(
                 real_w_m,
                 real_h_m,
                 output_path,
-                water_rgb=hex_to_rgb(water_hex),
-                greenery_rgb=hex_to_rgb(greenery_hex),
-                building_rgb=hex_to_rgb(building_hex),
-                background_rgb=hex_to_rgb(background_hex),
+                water_rgb=hex_to_rgb(water_hex, (0.77, 0.86, 0.91)),
+                greenery_rgb=hex_to_rgb(greenery_hex, (0.86, 0.91, 0.85)),
+                road_rgb=hex_to_rgb(road_hex, (0.60, 0.60, 0.60)),
+                building_rgb=hex_to_rgb(building_hex, (0.0, 0.0, 0.0)),
+                background_rgb=hex_to_rgb(background_hex, (1.0, 1.0, 1.0)),
             )
         elif ext == ".svg":
             render_svg(
@@ -820,6 +1180,7 @@ def generate_schwarzplan(
                 output_path,
                 water_hex=water_hex,
                 greenery_hex=greenery_hex,
+                road_hex=road_hex,
                 building_hex=building_hex,
                 background_hex=background_hex,
             )
@@ -839,6 +1200,7 @@ def generate_schwarzplan(
             "building_count": len(layers["buildings"]),
             "water_count": len(layers["water"]),
             "greenery_count": len(layers["greenery"]),
+            "road_count": len(layers["roads"]),
             "coverage_w_m": real_w_m,
             "coverage_h_m": real_h_m,
         }

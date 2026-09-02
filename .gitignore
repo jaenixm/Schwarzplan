@@ -23,14 +23,26 @@ env/
 ehthumbs.db
 Thumbs.db
 
-# Generated output plans
+# Generated output plans (docs/example.png is committed on purpose)
 *.pdf
 *.svg
 *.dxf
+*.aux.xml
 
-# OSM Response Cache
+# OSM response cache. The app writes to the user cache directory now; these are
+# leftovers from older versions.
 src/cache/
 cache/
+
+# Python wheels are fetched by pip, never committed
+*.whl
+
+# Manual Flet probes
+scratch/
+
+# Test and tooling caches
+.pytest_cache/
+.coverage
 
 # IDEs
 .idea/

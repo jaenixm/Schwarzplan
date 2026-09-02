@@ -10,20 +10,39 @@ import sys
 import ssl
 import json
 import math
+import time
 import tempfile
 import traceback
 import threading
+import subprocess
 import urllib.request
 import urllib.parse
 
+
+def _log_dir():
+    """A user-writable directory for crash logs, per platform convention."""
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        candidate = os.path.join(home, "Library", "Logs", "Schwarzplan")
+    elif sys.platform == "win32":
+        root = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        candidate = os.path.join(root, "Schwarzplan", "Logs")
+    else:
+        root = os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state")
+        candidate = os.path.join(root, "schwarzplan")
+    try:
+        os.makedirs(candidate, exist_ok=True)
+        return candidate
+    except Exception:
+        return tempfile.gettempdir()
+
+
 def __log_crash(e):
     try:
-        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-        if not os.path.exists(desktop) or not os.access(desktop, os.W_OK):
-            desktop = tempfile.gettempdir()
-        log_path = os.path.join(desktop, "schwarzplan_crash.txt")
-        with open(log_path, "w", encoding="utf-8") as f:
-            f.write("A fatal error occurred during Schwarzplan App launch:\n\n" + traceback.format_exc())
+        log_path = os.path.join(_log_dir(), "schwarzplan_crash.txt")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            f.write(traceback.format_exc())
     except Exception:
         pass
 
@@ -33,13 +52,40 @@ try:
 
     from schwarzplan_engine import (
         generate_schwarzplan,
+        normalize_hex,
         PAPER_SIZES,
         SCALE_OPTIONS,
         SUPPORTED_FORMATS,
+        USER_AGENT,
+        OSM_ATTRIBUTION,
     )
 except Exception as e:
     __log_crash(e)
     raise
+
+
+def default_save_dir():
+    """Where plans land when the user has not picked a folder."""
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    if os.path.isdir(desktop) and os.access(desktop, os.W_OK):
+        return desktop
+    return os.path.expanduser("~")
+
+
+def with_extension(name, fmt):
+    """
+    Returns the filename carrying the selected format's extension.
+
+    The format dropdown decides the format, so a name ending in .pdf must not
+    silently override a choice of SVG. Any directory part is dropped: a typed
+    path separator must not redirect where the file is written.
+    """
+    stem = os.path.basename((name or "").strip()) or "plan"
+    for ext in SUPPORTED_FORMATS:
+        if stem.lower().endswith(ext):
+            stem = stem[: -len(ext)]
+            break
+    return f"{stem or 'plan'}.{fmt}"
 
 
 # ── Color Palettes & Basemaps ──────────────────────────────────────
@@ -53,7 +99,7 @@ DARK_PALETTE = {
     "border_subtle": "#2A2A2A",
     "accent": "#4FC3F7",
     "accent_hover": "#81D4FA",
-    "tile_url": "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+    "tile_url": "https://services.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
 }
 
 LIGHT_PALETTE = {
@@ -66,7 +112,7 @@ LIGHT_PALETTE = {
     "border_subtle": "#E2E8F0",
     "accent": "#0288D1",
     "accent_hover": "#039BE5",
-    "tile_url": "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+    "tile_url": "https://services.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
 }
 
 SUCCESS_GREEN = "#66BB6A"
@@ -77,8 +123,10 @@ def calculate_bbox_corners(center_lat: float, center_lon: float, paper_w_mm: flo
     """
     Computes geographic coordinates (NW, NE, SE, SW) of the exact printed map area.
     """
-    map_w_mm = max(10.0, paper_w_mm - 2 * margin_mm)
-    map_h_mm = max(10.0, paper_h_mm - 2 * margin_mm)
+    # No clamping here: the preview must describe exactly what the export will
+    # produce. Callers reject a border that does not fit before calling.
+    map_w_mm = paper_w_mm - 2 * margin_mm
+    map_h_mm = paper_h_mm - 2 * margin_mm
     real_w_m = (map_w_mm / 1000.0) * scale
     real_h_m = (map_h_mm / 1000.0) * scale
 
@@ -112,7 +160,8 @@ def main(page: ft.Page):
     is_dark = [is_os_dark]
     selected_lat = [53.5581]
     selected_lon = [9.9632]
-    chosen_save_path = [None]
+    chosen_save_dir = [None]
+    filename_is_custom = [False]
     last_generated_file = [None]
 
     def current_theme():
@@ -226,91 +275,96 @@ def main(page: ft.Page):
     )
     filename_field = styled_text_field(value="schwarzplan_a3_1_1000.pdf", label="Filename")
 
-    # ── Urban Context Layers (Buildings, Water, Greenery) ──────────
-    building_color_val = ["#000000" if not is_dark[0] else "#F0F0F0"]
-    water_color_val = ["#C5DCE8" if not is_dark[0] else "#1E2D3D"]
-    greenery_color_val = ["#DCE8D8" if not is_dark[0] else "#203324"]
+    # ── Urban Context Layers (Buildings, Water, Greenery, Roadways) ──
+    def bind_color_field(field, swatch, on_valid):
+        """
+        Keeps a swatch in step with a hex field and marks unreadable input.
 
-    building_checkbox = ft.Checkbox(
-        label="Buildings (Schwarzplan)",
-        value=True,
-        label_style=ft.TextStyle(size=12, color=initial_pal["text_primary"], weight=ft.FontWeight.W_500),
-        active_color=initial_pal["accent"],
-    )
-    building_color_box = ft.Container(
-        width=20, height=20, border_radius=4,
-        bgcolor=building_color_val[0],
-        border=ft.Border.all(1, initial_pal["border_subtle"]),
-    )
-    building_color_field = styled_text_field(
-        value=building_color_val[0],
-        label="Bldg Hex",
-        width=100,
-        height=40,
-    )
-
-    def on_building_color_change(e):
-        hex_val = building_color_field.value.strip()
-        if len(hex_val) == 7 and hex_val.startswith("#"):
-            building_color_val[0] = hex_val
-            building_color_box.bgcolor = hex_val
+        Only a colour that parses reaches on_valid, so a half-typed hex can
+        never reach an export.
+        """
+        def handler(e):
+            parsed = normalize_hex(field.value)
+            if parsed:
+                on_valid(parsed)
+                swatch.bgcolor = parsed
+                field.border_color = current_theme()["border_subtle"]
+            else:
+                field.border_color = ERROR_RED
             page.update()
 
-    building_color_field.on_change = on_building_color_change
+        field.on_change = handler
 
-    water_checkbox = ft.Checkbox(
-        label="Waterways (Blauplan)",
-        value=False,
-        label_style=ft.TextStyle(size=12, color=initial_pal["text_primary"], weight=ft.FontWeight.W_500),
-        active_color=initial_pal["accent"],
-    )
-    water_color_box = ft.Container(
+    class LayerControl:
+        """A checkbox, colour swatch and hex field for one map layer."""
+
+        def __init__(self, label, hex_label, default_hex, checked):
+            self.color = default_hex
+            self.checkbox = ft.Checkbox(
+                label=label,
+                value=checked,
+                label_style=ft.TextStyle(
+                    size=12, color=initial_pal["text_primary"], weight=ft.FontWeight.W_500
+                ),
+                active_color=initial_pal["accent"],
+                on_change=lambda e: update_coverage_and_preview(),
+            )
+            self.swatch = ft.Container(
+                width=20, height=20, border_radius=4,
+                bgcolor=self.color,
+                border=ft.Border.all(1, initial_pal["border_subtle"]),
+            )
+            self.field = styled_text_field(
+                value=self.color, label=hex_label, width=100, height=40,
+            )
+            bind_color_field(self.field, self.swatch, self._set_color)
+
+        def _set_color(self, value):
+            self.color = value
+
+        @property
+        def enabled(self):
+            return bool(self.checkbox.value)
+
+        def apply_theme(self, pal):
+            self.checkbox.label_style = ft.TextStyle(
+                size=12, color=pal["text_primary"], weight=ft.FontWeight.W_500
+            )
+            self.checkbox.active_color = pal["accent"]
+            self.swatch.border = ft.Border.all(1, pal["border_subtle"])
+
+        def row(self):
+            return ft.Row(
+                [ft.Container(content=self.checkbox, expand=True), self.swatch, self.field],
+                spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            )
+
+    building_layer = LayerControl("Buildings (Schwarzplan)", "Bldg Hex", "#000000", True)
+    water_layer = LayerControl("Waterways (Blauplan)", "Water Hex", "#C5DCE8", False)
+    greenery_layer = LayerControl("Parks & Greenery (Gr\u00fcnplan)", "Green Hex", "#DCE8D8", False)
+    roadway_layer = LayerControl("Roadways (Strassennetz)", "Road Hex", "#A0A0A0", False)
+    map_layers = [building_layer, water_layer, greenery_layer, roadway_layer]
+
+    # Paper colour is a print decision, not a UI-theme decision, so it gets its
+    # own control and stays white whichever theme the app is in.
+    background_swatch = ft.Container(
         width=20, height=20, border_radius=4,
-        bgcolor=water_color_val[0],
+        bgcolor="#FFFFFF",
         border=ft.Border.all(1, initial_pal["border_subtle"]),
     )
-    water_color_field = styled_text_field(
-        value=water_color_val[0],
-        label="Water Hex",
-        width=100,
-        height=40,
+    background_color = ["#FFFFFF"]
+    background_field = styled_text_field(
+        value="#FFFFFF", label="Paper Hex", width=100, height=40,
     )
 
-    def on_water_color_change(e):
-        hex_val = water_color_field.value.strip()
-        if len(hex_val) == 7 and hex_val.startswith("#"):
-            water_color_val[0] = hex_val
-            water_color_box.bgcolor = hex_val
-            page.update()
-
-    water_color_field.on_change = on_water_color_change
-
-    greenery_checkbox = ft.Checkbox(
-        label="Parks & Greenery (Grünplan)",
-        value=False,
-        label_style=ft.TextStyle(size=12, color=initial_pal["text_primary"], weight=ft.FontWeight.W_500),
-        active_color=initial_pal["accent"],
+    bind_color_field(
+        background_field, background_swatch,
+        lambda value: background_color.__setitem__(0, value),
     )
-    greenery_color_box = ft.Container(
-        width=20, height=20, border_radius=4,
-        bgcolor=greenery_color_val[0],
-        border=ft.Border.all(1, initial_pal["border_subtle"]),
+    background_label = ft.Text(
+        "Paper Background", size=12, color=initial_pal["text_primary"],
+        weight=ft.FontWeight.W_500,
     )
-    greenery_color_field = styled_text_field(
-        value=greenery_color_val[0],
-        label="Green Hex",
-        width=100,
-        height=40,
-    )
-
-    def on_greenery_color_change(e):
-        hex_val = greenery_color_field.value.strip()
-        if len(hex_val) == 7 and hex_val.startswith("#"):
-            greenery_color_val[0] = hex_val
-            greenery_color_box.bgcolor = hex_val
-            page.update()
-
-    greenery_color_field.on_change = on_greenery_color_change
 
     # ── Coverage Badge & Bounding Box Marker ───────────────────────
     coverage_icon = ft.Icon(ft.Icons.SQUARE_FOOT, color=initial_pal["accent"], size=14)
@@ -333,62 +387,68 @@ def main(page: ft.Page):
         color=ft.Colors.with_opacity(0.18, initial_pal["accent"]),
     )
 
+    # Filenames for the layer combinations that have an established German name.
+    PLAN_NAMES = {
+        (True, False, False, False): "schwarzplan",
+        (False, True, False, False): "blauplan",
+        (False, False, True, False): "gruenplan",
+        (False, False, False, True): "strassenplan",
+        (False, True, True, False): "freiraumplan",
+    }
+
     def update_coverage_and_preview(e=None):
         try:
-            scale_val = int(scale_dropdown.value or "1000")
+            try:
+                scale_val = int(scale_dropdown.value or "1000")
+            except (TypeError, ValueError):
+                scale_val = 1000
             paper_key = paper_dropdown.value or "A3 Landscape"
-            margin_mm = float(margin_field.value or "15")
             fmt_ext = format_dropdown.value or "pdf"
             p = PAPER_SIZES.get(paper_key, PAPER_SIZES["A3 Landscape"])
+
+            try:
+                margin_mm = float(margin_field.value)
+            except (TypeError, ValueError):
+                # Say so rather than freezing the badge on a stale number.
+                coverage_text.value = "Border must be a number in millimetres"
+                page.update()
+                return
+
+            if margin_mm < 0 or 2 * margin_mm >= min(p["width_mm"], p["height_mm"]):
+                coverage_text.value = "Border does not fit the selected paper"
+                page.update()
+                return
 
             coords, rw, rh = calculate_bbox_corners(
                 selected_lat[0], selected_lon[0],
                 p["width_mm"], p["height_mm"],
                 margin_mm, scale_val,
             )
+            area_km2 = (rw * rh) / 1_000_000.0
+            coverage_text.value = f"Print Coverage: {rw:.0f}m × {rh:.0f}m ({area_km2:.2f} km²)"
 
-            if rw > 0 and rh > 0:
-                area_km2 = (rw * rh) / 1_000_000.0
-                coverage_text.value = f"Print Coverage: {rw:.0f}m × {rh:.0f}m ({area_km2:.2f} km²)"
-            else:
-                coverage_text.value = "Margin exceeds paper size"
-
-            if chosen_save_path[0] is None:
+            if not filename_is_custom[0]:
                 safe_paper = paper_key.lower().replace(" ", "_").replace("×", "x")
-                b = bool(building_checkbox.value)
-                w = bool(water_checkbox.value)
-                g = bool(greenery_checkbox.value)
-                if b and not w and not g:
-                    prefix = "schwarzplan"
-                elif not b and w and not g:
-                    prefix = "blauplan"
-                elif not b and not w and g:
-                    prefix = "gruenplan"
-                elif not b and w and g:
-                    prefix = "freiraumplan"
-                elif b and (w or g):
-                    prefix = "schwarzplan_context"
-                else:
-                    prefix = "plan"
+                selection = (
+                    building_layer.enabled, water_layer.enabled,
+                    greenery_layer.enabled, roadway_layer.enabled,
+                )
+                prefix = PLAN_NAMES.get(selection) or (
+                    "schwarzplan_context" if selection[0] else "urban_context"
+                )
                 filename_field.value = f"{prefix}_{safe_paper}_1_{scale_val}.{fmt_ext}"
 
             bbox_poly_marker.coordinates = coords
             if polygon_layer_ref.current:
                 polygon_layer_ref.current.polygons = [bbox_poly_marker]
-                try:
-                    polygon_layer_ref.current.update()
-                except Exception:
-                    pass
-
+                polygon_layer_ref.current.update()
             if map_ref.current:
-                try:
-                    map_ref.current.update()
-                except Exception:
-                    pass
+                map_ref.current.update()
 
             page.update()
         except Exception:
-            pass
+            # Silently passing here hides real bugs, so leave a trace.
+            __log_crash(None)
 
     scale_dropdown.on_select = update_coverage_and_preview
     scale_dropdown.on_change = update_coverage_and_preview
@@ -398,9 +458,11 @@ def main(page: ft.Page):
     format_dropdown.on_change = update_coverage_and_preview
     margin_field.on_change = update_coverage_and_preview
     margin_field.on_blur = update_coverage_and_preview
-    building_checkbox.on_change = update_coverage_and_preview
-    water_checkbox.on_change = update_coverage_and_preview
-    greenery_checkbox.on_change = update_coverage_and_preview
+
+    def on_filename_edited(e):
+        filename_is_custom[0] = bool((filename_field.value or "").strip())
+
+    filename_field.on_change = on_filename_edited
 
     # ── Coordinates manual edit handler ────────────────────────────
     def on_coords_changed(e=None):
@@ -434,23 +496,57 @@ def main(page: ft.Page):
     status_text = ft.Text("", size=12, color=initial_pal["text_secondary"], text_align=ft.TextAlign.CENTER)
     status_icon = ft.Icon(ft.Icons.INFO_OUTLINE, color=initial_pal["accent"], size=16, visible=False)
 
+    def show_status(text, ok=None, show_actions=False):
+        """Drives the status line, its icon and the two file buttons together."""
+        status_text.value = text
+        if ok is None:
+            status_icon.visible = False
+            status_text.color = current_theme()["text_secondary"]
+        else:
+            status_icon.visible = True
+            status_icon.icon = ft.Icons.CHECK_CIRCLE_OUTLINE if ok else ft.Icons.ERROR_OUTLINE
+            status_icon.color = SUCCESS_GREEN if ok else ERROR_RED
+            status_text.color = SUCCESS_GREEN if ok else ERROR_RED
+        open_file_btn.visible = show_actions
+        open_folder_btn.visible = show_actions
+        try:
+            page.update()
+        except Exception:
+            pass
+
+    def _reveal(path, in_folder):
+        """
+        Hands the path to the OS as an argument, never as shell text.
+
+        A filename can legitimately contain quotes and semicolons, and string
+        interpolation into a shell command would run them.
+        """
+        if sys.platform == "darwin":
+            subprocess.run(["open", "-R", path] if in_folder else ["open", path], check=False)
+        elif sys.platform == "win32":
+            if in_folder:
+                subprocess.run(["explorer", f"/select,{path}"], check=False)
+            else:
+                os.startfile(path)  # noqa: S606 - Windows-only, takes a path not a command
+        else:
+            target = os.path.dirname(path) if in_folder else path
+            subprocess.run(["xdg-open", target], check=False)
+
     def open_generated_file(e):
         path = last_generated_file[0]
         if path and os.path.exists(path):
-            if sys.platform == "darwin":
-                os.system(f'open "{path}"')
-            elif sys.platform == "win32":
-                os.startfile(path)
-            else:
-                os.system(f'xdg-open "{path}"')
+            try:
+                _reveal(path, in_folder=False)
+            except Exception:
+                show_status(f"Could not open {os.path.basename(path)}.", ok=False)
 
     def open_folder(e):
         path = last_generated_file[0]
         if path and os.path.exists(path):
-            if sys.platform == "darwin":
-                os.system(f'open -R "{path}"')
-            elif sys.platform == "win32":
-                os.system(f'explorer /select,"{path}"')
+            try:
+                _reveal(path, in_folder=True)
+            except Exception:
+                show_status("Could not open the containing folder.", ok=False)
 
     open_file_btn = ft.IconButton(
         icon=ft.Icons.OPEN_IN_NEW,
@@ -480,16 +576,16 @@ def main(page: ft.Page):
 
     async def browse_clicked(e):
         fmt = format_dropdown.value or "pdf"
-        default_name = filename_field.value or f"schwarzplan.{fmt}"
         result = await file_picker.save_file(
             dialog_title="Save Schwarzplan Diagram",
-            file_name=default_name,
-            allowed_extensions=[fmt, "pdf", "svg", "dxf"],
+            file_name=with_extension(filename_field.value, fmt),
+            allowed_extensions=[fmt],
             file_type=ft.FilePickerFileType.CUSTOM,
         )
         if result:
-            chosen_save_path[0] = result
-            filename_field.value = os.path.basename(result)
+            chosen_save_dir[0] = os.path.dirname(result) or None
+            filename_field.value = with_extension(os.path.basename(result), fmt)
+            filename_is_custom[0] = True
             page.update()
 
     browse_btn = ft.IconButton(
@@ -529,6 +625,10 @@ def main(page: ft.Page):
         ref=tile_layer_ref,
         url_template=initial_pal["tile_url"],
         user_agent_package_name="schwarzplan.app.user_agent",
+        min_native_zoom=0,
+        max_native_zoom=16,
+        min_zoom=2,
+        max_zoom=16,
     )
 
     polygon_layer = ftm.PolygonLayer(
@@ -555,7 +655,9 @@ def main(page: ft.Page):
         ref=map_ref,
         expand=True,
         initial_center=ftm.MapLatitudeLongitude(selected_lat[0], selected_lon[0]),
-        initial_zoom=14, min_zoom=3, max_zoom=19,
+        initial_zoom=14,
+        min_zoom=2,
+        max_zoom=16,
         on_tap=on_map_tap,
         interaction_configuration=ftm.InteractionConfiguration(
             flags=ftm.InteractionFlag.ALL,
@@ -575,9 +677,18 @@ def main(page: ft.Page):
     )
     search_status = ft.Text("", size=11, color=initial_pal["text_secondary"])
 
+    # Nominatim's usage policy allows at most one request per second and requires
+    # a User-Agent that identifies the app. Going over gets the app blocked for
+    # everyone using it, so the limit is enforced here rather than trusted to the
+    # user's typing speed.
+    search_lock = threading.Lock()
+    last_search_at = [0.0]
+
     def do_search(e=None):
         query = (search_input.value or "").strip()
         if not query:
+            return
+        if not search_lock.acquire(blocking=False):
             return
         search_status.value = "Searching OpenStreetMap…"
         search_status.color = current_theme()["text_secondary"]
@@ -585,10 +696,19 @@ def main(page: ft.Page):
 
         def _search_thread():
             try:
+                wait = 1.0 - (time.monotonic() - last_search_at[0])
+                if wait > 0:
+                    time.sleep(wait)
+                last_search_at[0] = time.monotonic()
+
                 url = f"https://nominatim.openstreetmap.org/search?{urllib.parse.urlencode({'q': query, 'format': 'json', 'limit': 1})}"
-                req = urllib.request.Request(url, headers={"User-Agent": "SchwarzplanApp/2.0"})
-                ctx = ssl.create_default_context()
-                with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
+                req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+                try:
+                    import certifi
+                    ctx = ssl.create_default_context(cafile=certifi.where())
+                except Exception:
+                    ctx = ssl.create_default_context()
+                with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     if data:
                         hit = data[0]
@@ -616,9 +736,11 @@ def main(page: ft.Page):
                     else:
                         search_status.value = "No location found."
                         search_status.color = ERROR_RED
-            except Exception as err:
-                search_status.value = f"Search error: {str(err)}"
+            except Exception:
+                search_status.value = "Could not reach the search service."
                 search_status.color = ERROR_RED
+            finally:
+                search_lock.release()
             try:
                 page.update()
             except Exception:
@@ -647,8 +769,8 @@ def main(page: ft.Page):
 
     all_styled_fields = [
         lat_field, lon_field, margin_field, filename_field, search_input,
-        building_color_field, water_color_field, greenery_color_field,
-    ]
+        background_field,
+    ] + [layer.field for layer in map_layers]
     all_styled_dropdowns = [scale_dropdown, paper_dropdown, format_dropdown]
 
     def toggle_theme(e):
@@ -689,19 +811,18 @@ def main(page: ft.Page):
         paper_label.color = pal["text_secondary"]
         bottom_helper_text.color = pal["text_secondary"]
         bottom_helper_icon.color = pal["text_secondary"]
+        attribution_text.color = pal["text_secondary"]
 
         div1.color = pal["border_subtle"]
         div2.color = pal["border_subtle"]
         div3.color = pal["border_subtle"]
         div4.color = pal["border_subtle"]
 
-        # Update checkboxes
-        building_checkbox.label_style = ft.TextStyle(size=12, color=pal["text_primary"], weight=ft.FontWeight.W_500)
-        building_checkbox.active_color = pal["accent"]
-        water_checkbox.label_style = ft.TextStyle(size=12, color=pal["text_primary"], weight=ft.FontWeight.W_500)
-        water_checkbox.active_color = pal["accent"]
-        greenery_checkbox.label_style = ft.TextStyle(size=12, color=pal["text_primary"], weight=ft.FontWeight.W_500)
-        greenery_checkbox.active_color = pal["accent"]
+        # Update layer controls
+        for layer in map_layers:
+            layer.apply_theme(pal)
+        background_label.color = pal["text_primary"]
+        background_swatch.border = ft.Border.all(1, pal["border_subtle"])
 
         # Update Form Fields & Dropdowns
         for f in all_styled_fields:
@@ -711,6 +832,12 @@ def main(page: ft.Page):
             f.focused_border_color = pal["accent"]
             f.cursor_color = pal["accent"]
             f.label_style = ft.TextStyle(size=11, color=pal["text_secondary"])
+
+        # The loop above repaints every border, so restore the warning on any
+        # colour field that still holds text we cannot read.
+        for f in [background_field] + [layer.field for layer in map_layers]:
+            if normalize_hex(f.value) is None:
+                f.border_color = ERROR_RED
 
         for d in all_styled_dropdowns:
             d.bgcolor = pal["bg_input"]
@@ -755,60 +882,46 @@ def main(page: ft.Page):
             lat = float(lat_field.value)
             lon = float(lon_field.value)
         except (ValueError, TypeError):
-            status_icon.visible = True
-            status_icon.icon = ft.Icons.ERROR_OUTLINE
-            status_icon.color = ERROR_RED
-            status_text.value = "Invalid coordinate numbers."
-            status_text.color = ERROR_RED
-            open_file_btn.visible = False
-            open_folder_btn.visible = False
-            page.update()
+            show_status("Latitude and longitude must be numbers.", ok=False)
             return
 
-        inc_b = bool(building_checkbox.value)
-        inc_w = bool(water_checkbox.value)
-        inc_g = bool(greenery_checkbox.value)
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            show_status("Latitude must be -90 to 90 and longitude -180 to 180.", ok=False)
+            return
 
-        if not inc_b and not inc_w and not inc_g:
-            status_icon.visible = True
-            status_icon.icon = ft.Icons.ERROR_OUTLINE
-            status_icon.color = ERROR_RED
-            status_text.value = "Please select at least one layer to export."
-            status_text.color = ERROR_RED
-            open_file_btn.visible = False
-            open_folder_btn.visible = False
-            page.update()
+        inc_b = building_layer.enabled
+        inc_w = water_layer.enabled
+        inc_g = greenery_layer.enabled
+        inc_r = roadway_layer.enabled
+
+        if not (inc_b or inc_w or inc_g or inc_r):
+            show_status("Select at least one layer to export.", ok=False)
             return
 
         try:
             margin_mm = float(margin_field.value)
         except (ValueError, TypeError):
-            margin_mm = 15.0
+            show_status("Border must be a number in millimetres.", ok=False)
+            return
 
-        scale_val = int(scale_dropdown.value)
-        paper_val = paper_dropdown.value
+        try:
+            scale_val = int(scale_dropdown.value)
+        except (ValueError, TypeError):
+            scale_val = 1000
+        paper_val = paper_dropdown.value or "A3 Landscape"
         fmt_val = format_dropdown.value or "pdf"
 
-        fname = filename_field.value or f"plan.{fmt_val}"
-        if not any(fname.lower().endswith(ext) for ext in SUPPORTED_FORMATS):
-            fname = f"{fname}.{fmt_val}"
+        # The format dropdown decides the format, so the name always matches it.
+        fname = with_extension(filename_field.value, fmt_val)
+        filename_field.value = fname
 
-        desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
-        if not os.path.exists(desktop_path) or not os.access(desktop_path, os.W_OK):
-            desktop_path = os.path.expanduser("~")
-
-        output_path = chosen_save_path[0] or os.path.join(desktop_path, fname)
+        output_path = os.path.join(chosen_save_dir[0] or default_save_dir(), fname)
         last_generated_file[0] = output_path
 
         generate_btn.disabled = True
         progress_bar.visible = True
         progress_bar.value = 0
-        status_icon.visible = False
-        open_file_btn.visible = False
-        open_folder_btn.visible = False
-        status_text.value = "Contacting OpenStreetMap…"
-        status_text.color = current_theme()["text_secondary"]
-        page.update()
+        show_status("Contacting OpenStreetMap…")
 
         def on_progress(text, pct):
             progress_bar.value = pct if pct >= 0 else None
@@ -819,52 +932,51 @@ def main(page: ft.Page):
                 pass
 
         def run_generation():
-            result = generate_schwarzplan(
-                center_lat=lat, center_lon=lon,
-                scale=scale_val, paper_size=paper_val,
-                margin_mm=margin_mm, output_path=output_path,
-                include_buildings=inc_b,
-                building_hex=building_color_field.value or ("#000000" if not is_dark[0] else "#FFFFFF"),
-                include_water=inc_w,
-                water_hex=water_color_field.value or "#C5DCE8",
-                include_greenery=inc_g,
-                greenery_hex=greenery_color_field.value or "#DCE8D8",
-                background_hex="#FFFFFF" if not is_dark[0] else "#0D0D0D",
-                on_progress=on_progress,
-            )
+            try:
+                result = generate_schwarzplan(
+                    center_lat=lat, center_lon=lon,
+                    scale=scale_val, paper_size=paper_val,
+                    margin_mm=margin_mm, output_path=output_path,
+                    include_buildings=inc_b,
+                    building_hex=building_layer.color,
+                    include_water=inc_w,
+                    water_hex=water_layer.color,
+                    include_greenery=inc_g,
+                    greenery_hex=greenery_layer.color,
+                    include_roads=inc_r,
+                    road_hex=roadway_layer.color,
+                    background_hex=background_color[0],
+                    on_progress=on_progress,
+                )
+            except Exception:
+                # Without this the worker thread would die silently and leave the
+                # button disabled and the progress bar spinning forever.
+                __log_crash(None)
+                progress_bar.visible = False
+                show_status("Something went wrong. See the log in the Schwarzplan folder.", ok=False)
+                return
+            finally:
+                generate_btn.disabled = False
 
-            generate_btn.disabled = False
             if result["success"]:
                 progress_bar.value = 1.0
-                status_icon.visible = True
-                status_icon.icon = ft.Icons.CHECK_CIRCLE_OUTLINE
-                status_icon.color = SUCCESS_GREEN
-                
-                parts = []
-                if inc_b:
-                    parts.append(f"{result.get('building_count', 0)} bldgs")
-                if inc_w:
-                    parts.append(f"{result.get('water_count', 0)} water")
-                if inc_g:
-                    parts.append(f"{result.get('greenery_count', 0)} parks")
-                
-                status_text.value = f"✓ {os.path.basename(result['output_path'])} ({', '.join(parts)})"
-                status_text.color = SUCCESS_GREEN
-                open_file_btn.visible = True
-                open_folder_btn.visible = True
+                counts = [
+                    (inc_b, "building_count", "bldgs"),
+                    (inc_w, "water_count", "water"),
+                    (inc_g, "greenery_count", "parks"),
+                    (inc_r, "road_count", "roads"),
+                ]
+                parts = [
+                    f"{result.get(key, 0)} {word}"
+                    for included, key, word in counts if included
+                ]
+                show_status(
+                    f"{os.path.basename(result['output_path'])} ({', '.join(parts)})",
+                    ok=True, show_actions=True,
+                )
             else:
                 progress_bar.visible = False
-                status_icon.visible = True
-                status_icon.icon = ft.Icons.ERROR_OUTLINE
-                status_icon.color = ERROR_RED
-                status_text.value = result["message"]
-                status_text.color = ERROR_RED
-                open_file_btn.visible = False
-                open_folder_btn.visible = False
-            try:
-                page.update()
-            except Exception:
-                pass
+                show_status(result["message"], ok=False)
 
         threading.Thread(target=run_generation, daemon=True).start()
 
@@ -914,23 +1026,14 @@ def main(page: ft.Page):
                 ft.Container(height=6),
                 div3,
 
-                # Urban Context Layers (Buildings, Water & Greenery)
+                # Urban Context Layers (Buildings, Water, Greenery & Roadways)
                 ft.Container(height=4),
                 context_header,
+                *[layer.row() for layer in map_layers],
                 ft.Row([
-                    ft.Container(content=building_checkbox, expand=True),
-                    building_color_box,
-                    building_color_field,
-                ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                ft.Row([
-                    ft.Container(content=water_checkbox, expand=True),
-                    water_color_box,
-                    water_color_field,
-                ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                ft.Row([
-                    ft.Container(content=greenery_checkbox, expand=True),
-                    greenery_color_box,
-                    greenery_color_field,
+                    ft.Container(content=background_label, expand=True),
+                    background_swatch,
+                    background_field,
                 ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
 
                 ft.Container(height=6),
@@ -978,6 +1081,10 @@ def main(page: ft.Page):
 
     bottom_helper_icon = ft.Icon(ft.Icons.TOUCH_APP, size=13, color=initial_pal["text_secondary"])
     bottom_helper_text = ft.Text("Click on the map to set center pin. Drag or pinch/scroll on trackpad to zoom & navigate.", size=11, color=initial_pal["text_secondary"])
+    attribution_text = ft.Text(
+        f"{OSM_ATTRIBUTION}  \u00b7  Basemap \u00a9 CARTO",
+        size=10, color=initial_pal["text_secondary"],
+    )
 
     map_view = ft.Container(
         content=ft.Column([
@@ -997,7 +1104,9 @@ def main(page: ft.Page):
                 content=ft.Row([
                     bottom_helper_icon,
                     bottom_helper_text,
-                ], spacing=4),
+                    ft.Container(expand=True),
+                    attribution_text,
+                ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 padding=ft.Padding.only(top=6, left=4),
             ),
         ], spacing=0),
