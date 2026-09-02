@@ -52,10 +52,32 @@ jobs:
           APP=$(find build/macos -maxdepth 2 -name '*.app' | head -1)
           if [ -z "$APP" ]; then echo "No .app produced"; exit 1; fi
           echo "Packaging $APP"
+
+          # flet build seals a symlink to this runner's ~/.pub-cache into the
+          # bundle. It points outside the bundle by absolute path, so on anyone
+          # else's machine it dangles and makes the documented
+          # "xattr -dr com.apple.quarantine" print an alarming error. Removing
+          # it breaks the ad-hoc signature, so re-sign afterwards. Only
+          # absolute targets are stripped; the framework's own relative
+          # symlinks must stay.
+          find "$APP" -type l -exec sh -c \
+            'case "$(readlink "$1")" in /*) echo "stripping $1"; rm -f "$1";; esac' _ {} \;
+          codesign --force --deep --sign - "$APP"
+          codesign -v --deep --strict "$APP"
+
           ditto -c -k --sequesterRsrc --keepParent "$APP" Schwarzplan-macOS.zip
+
+          rm -rf /tmp/verify
           ditto -V -x -k Schwarzplan-macOS.zip /tmp/verify
-          test -x "/tmp/verify/$(basename "$APP")/Contents/MacOS/$(basename "$APP" .app)" \
+          VERIFY="/tmp/verify/$(basename "$APP")"
+          test -x "$VERIFY/Contents/MacOS/$(basename "$APP" .app)" \
             || { echo "Executable bit lost in packaging"; exit 1; }
+          ABS=$(find "$VERIFY" -type l -exec sh -c \
+            'case "$(readlink "$1")" in /*) echo x;; esac' _ {} \; | wc -l)
+          test "$ABS" -eq 0 \
+            || { echo "$ABS symlink(s) pointing outside the bundle would ship"; exit 1; }
+          codesign -v --deep --strict "$VERIFY" \
+            || { echo "Signature invalid after packaging"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         with:
