@@ -13,6 +13,12 @@ dependencies = [
     "certifi>=2024.7.4",
 ]
 
+[tool.pytest.ini_options]
+# Without this, a bare "python -m pytest" crawls the 16k files that flet build
+# leaves under build/ and appears to hang.
+testpaths = ["tests"]
+norecursedirs = ["build", "dist", "cache", "scratch", ".git", ".venv"]
+
 [tool.flet]
 # Names the built bundle: Schwarzplan.app and Schwarzplan.exe. Without this the
 # lowercase project name is used, which the install instructions do not match.

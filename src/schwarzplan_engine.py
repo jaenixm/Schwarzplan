@@ -279,8 +279,11 @@ out skel qt;"""
     except ImportError:
         requests = None
 
+    total = len(OVERPASS_ENDPOINTS)
     if requests is not None:
-        for endpoint in OVERPASS_ENDPOINTS:
+        for attempt, endpoint in enumerate(OVERPASS_ENDPOINTS, 1):
+            if on_progress and attempt > 1:
+                on_progress(f"Mirror {attempt - 1} did not answer, trying {attempt} of {total}…", 0.15)
             try:
                 resp = requests.post(
                     endpoint, data={"data": overpass_query}, headers=headers, timeout=60
@@ -312,7 +315,9 @@ out skel qt;"""
     except Exception:
         ssl_ctx = ssl.create_default_context()
 
-    for endpoint in OVERPASS_ENDPOINTS:
+    for attempt, endpoint in enumerate(OVERPASS_ENDPOINTS, 1):
+        if on_progress and attempt > 1:
+            on_progress(f"Mirror {attempt - 1} did not answer, trying {attempt} of {total}…", 0.15)
         try:
             req = urllib.request.Request(endpoint, data=encoded_data, headers=headers)
             with urllib.request.urlopen(req, timeout=60, context=ssl_ctx) as resp:
@@ -722,13 +727,15 @@ def render_pdf(
     draw_roads(layers.get("roads", []), road_rgb)
     draw_layer_polygons(layers.get("buildings", []), building_rgb)
 
-    # 3. Outer border frame
+    pdf_cmds.append("Q")
+
+    # 3. Outer border frame. Drawn after the clip is released: the clip
+    #    rectangle is the frame itself, so stroking inside it cut the outer
+    #    half of the line away and the border came out at half weight.
     fr, fg, fb = (0.0, 0.0, 0.0) if background_rgb[0] > 0.5 else (1.0, 1.0, 1.0)
     pdf_cmds.append(f"{fr:.3f} {fg:.3f} {fb:.3f} RG")
     pdf_cmds.append("0.5 w")
     pdf_cmds.append(f"{margin_pt:.2f} {margin_pt:.2f} {map_w_pt:.2f} {map_h_pt:.2f} re S")
-
-    pdf_cmds.append("Q")
 
     # 4. ODbL attribution. Sits in the margin, below the frame.
     label_pt = 6.0
@@ -906,6 +913,19 @@ def render_svg(
         f.write("\n".join(svg_lines))
 
 
+def _dxf_ring(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """
+    Drops the repeated closing vertex from a ring.
+
+    OSM rings repeat the first point at the end. Writing that alongside the
+    LWPOLYLINE closed flag (70=1) leaves a zero-length closing segment that
+    CAD software reports as a duplicate vertex.
+    """
+    if len(points) > 1 and points[0] == points[-1]:
+        return points[:-1]
+    return points
+
+
 def render_dxf(
     layers: Dict[str, List[Dict[str, Any]]],
     center_lat: float,
@@ -957,45 +977,37 @@ def render_dxf(
 
     for layer_name, layer_key in [("WATER", "water"), ("GREENERY", "greenery"), ("BUILDINGS", "buildings")]:
         for poly in layers.get(layer_key, []):
-            outer = poly["outer"]
-            if len(outer) >= 3:
+            for ring in [poly["outer"]] + list(poly.get("inners", [])):
+                vertices = _dxf_ring(ring)
+                if len(vertices) < 3:
+                    continue
                 dxf_lines.extend([
                     "0", "LWPOLYLINE",
                     "100", "AcDbEntity",
                     "8", layer_name,
                     "100", "AcDbPolyline",
-                    "90", str(len(outer)),
+                    "90", str(len(vertices)),
                     "70", "1",
                 ])
-                for lat, lon in outer:
+                for lat, lon in vertices:
                     xm, ym = latlon_to_metric(lat, lon, center_lat, center_lon)
                     dxf_lines.extend(["10", f"{xm:.3f}", "20", f"{ym:.3f}"])
-
-            for inner in poly.get("inners", []):
-                if len(inner) >= 3:
-                    dxf_lines.extend([
-                        "0", "LWPOLYLINE",
-                        "100", "AcDbEntity",
-                        "8", layer_name,
-                        "100", "AcDbPolyline",
-                        "90", str(len(inner)),
-                        "70", "1",
-                    ])
-                    for lat, lon in inner:
-                        xm, ym = latlon_to_metric(lat, lon, center_lat, center_lon)
-                        dxf_lines.extend(["10", f"{xm:.3f}", "20", f"{ym:.3f}"])
 
     for road in layers.get("roads", []):
         pts = road.get("points", [])
         if len(pts) >= 2:
-            is_closed = "1" if (len(pts) >= 4 and pts[0] == pts[-1]) else "0"
+            closed = len(pts) >= 4 and pts[0] == pts[-1]
+            if closed:
+                pts = _dxf_ring(pts)
+            if len(pts) < 2:
+                continue
             dxf_lines.extend([
                 "0", "LWPOLYLINE",
                 "100", "AcDbEntity",
                 "8", "ROADWAYS",
                 "100", "AcDbPolyline",
                 "90", str(len(pts)),
-                "70", is_closed,
+                "70", "1" if closed else "0",
             ])
             for lat, lon in pts:
                 xm, ym = latlon_to_metric(lat, lon, center_lat, center_lon)

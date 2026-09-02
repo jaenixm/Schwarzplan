@@ -120,7 +120,7 @@ def fit_scale_to_bbox(bbox, paper_size="A3 Landscape", margin_mm=15.0):
     return max(SCALE_OPTIONS)
 
 
-def create_schwarzplan_by_bbox(bbox, output_filename="schwarzplan.pdf", **kwargs):
+def create_schwarzplan_by_bbox(bbox, output_filename="schwarzplan.pdf", margin_mm=15.0, **kwargs):
     """
     Renders the area of a bounding box, choosing a scale that fits it on A3.
     bbox format: (north, south, east, west)
@@ -128,10 +128,13 @@ def create_schwarzplan_by_bbox(bbox, output_filename="schwarzplan.pdf", **kwargs
     north, south, east, west = bbox
     center_lat = (north + south) / 2.0
     center_lon = (east + west) / 2.0
-    scale = fit_scale_to_bbox(bbox)
+    # The margin has to reach the fitting maths, or the chosen scale is sized
+    # for a sheet with a different drawing area than the one being rendered.
+    scale = fit_scale_to_bbox(bbox, margin_mm=margin_mm)
     print(f"Generating Schwarzplan for BBox Center ({center_lat:.5f}, {center_lon:.5f}) at 1:{scale}…")
     create_schwarzplan_a3_landscape(
-        (center_lat, center_lon), scale=scale, output_filename=output_filename, **kwargs
+        (center_lat, center_lon), scale=scale, margin_mm=margin_mm,
+        output_filename=output_filename, **kwargs
     )
 
 

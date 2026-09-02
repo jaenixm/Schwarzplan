@@ -50,3 +50,18 @@ def test_chosen_scale_actually_fits_the_sheet(half_lat, half_lon):
     paper = PAPER_SIZES["A3 Landscape"]
     assert width_m <= (paper["width_mm"] - 30) / 1000.0 * scale
     assert height_m <= (paper["height_mm"] - 30) / 1000.0 * scale
+
+
+def test_margin_reaches_the_fitting_maths():
+    """A wider border leaves less drawing area, so the scale must get coarser."""
+    bbox = bbox_around(HAMBURG, 0.004, 0.006)
+    narrow = fit_scale_to_bbox(bbox, margin_mm=0.0)
+    wide = fit_scale_to_bbox(bbox, margin_mm=80.0)
+    assert wide >= narrow
+
+
+def test_paper_size_reaches_the_fitting_maths():
+    bbox = bbox_around(HAMBURG, 0.004, 0.006)
+    small = fit_scale_to_bbox(bbox, paper_size="A4 Landscape")
+    large = fit_scale_to_bbox(bbox, paper_size="A0 Landscape")
+    assert large <= small

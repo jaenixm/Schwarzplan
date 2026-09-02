@@ -105,6 +105,6 @@ publishes a GitHub Release with installation instructions attached.
 Map data is © OpenStreetMap contributors and available under the
 [Open Database License](https://www.openstreetmap.org/copyright). Every plan
 this app exports carries that attribution, and you must keep it on anything you
-publish. Basemap tiles in the app preview are © [CARTO](https://carto.com/attributions).
+publish. Basemap tiles in the app preview are © [Esri](https://www.esri.com/en-us/legal/terms/full-master-agreement).
 
 The app itself is MIT licensed — see [LICENSE](LICENSE).

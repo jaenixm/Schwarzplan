@@ -108,3 +108,23 @@ def test_mirrors_are_not_retried_twice(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError):
         engine.fetch_osm_layers(53.5, 9.9, 100.0, include_buildings=True)
     assert attempts == ["https://a.invalid", "https://b.invalid"]
+
+
+def test_progress_names_the_mirror_being_tried(monkeypatch, tmp_path):
+    """A silent five-minute wait across five mirrors reads as a hang."""
+    monkeypatch.setattr(engine, "_get_cache_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(engine, "OVERPASS_ENDPOINTS", ["https://a.invalid", "https://b.invalid"])
+    messages = []
+
+    class FakeRequests:
+        @staticmethod
+        def post(*a, **k):
+            raise OSError("boom")
+
+    monkeypatch.setitem(__import__("sys").modules, "requests", FakeRequests)
+    with pytest.raises(RuntimeError):
+        engine.fetch_osm_layers(
+            53.5, 9.9, 100.0, include_buildings=True,
+            on_progress=lambda text, pct: messages.append(text),
+        )
+    assert any("trying 2 of 2" in m for m in messages), messages

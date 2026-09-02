@@ -121,3 +121,58 @@ def test_generation_reports_counts(tmp_path, monkeypatch):
     assert result["building_count"] == 1
     assert result["water_count"] == 1
     assert result["greenery_count"] == 1
+
+
+def test_dxf_closed_polylines_have_no_duplicate_closing_vertex(tmp_path, layers):
+    """
+    A repeated end vertex alongside the closed flag (70=1) leaves a
+    zero-length segment that CAD software flags as a duplicate.
+    """
+    out = tmp_path / "p.dxf"
+    render_dxf(layers, 53.5581, 9.9632, str(out))
+    pairs = out.read_text(encoding="utf-8").split("\n")
+
+    i = 0
+    checked = 0
+    while i < len(pairs) - 1:
+        if pairs[i] == "0" and pairs[i + 1] == "LWPOLYLINE":
+            # Read this entity's vertex count, closed flag and coordinates.
+            count = closed = None
+            coords = []
+            j = i + 2
+            while j < len(pairs) - 1 and not (pairs[j] == "0" and pairs[j + 1] in ("LWPOLYLINE", "ENDSEC")):
+                if pairs[j] == "90":
+                    count = int(pairs[j + 1])
+                elif pairs[j] == "70" and closed is None:
+                    closed = pairs[j + 1]
+                elif pairs[j] == "10":
+                    coords.append((pairs[j + 1], pairs[j + 3]))
+                j += 2
+            if closed == "1":
+                assert len(coords) == count, "declared count must match written vertices"
+                assert coords[0] != coords[-1], "closed polyline repeats its first vertex"
+                checked += 1
+            i = j
+        else:
+            i += 2
+    assert checked > 0, "expected at least one closed polyline"
+
+
+def test_dxf_vertex_count_matches_declared_count(tmp_path, layers):
+    out = tmp_path / "p.dxf"
+    render_dxf(layers, 53.5581, 9.9632, str(out))
+    text = out.read_text(encoding="utf-8")
+    assert text.count("LWPOLYLINE") >= 3
+
+
+def test_border_is_stroked_outside_the_clip(tmp_path, layers):
+    """
+    The clip rectangle is the frame itself, so stroking inside it cut away the
+    outer half of the line and the border printed at half weight.
+    """
+    out = tmp_path / "p.pdf"
+    render_pdf(layers, output_path=str(out), **PAGE)
+    body = out.read_bytes().decode("latin-1")
+    clip_end = body.index("\nQ\n")
+    border = body.rindex(" re S")
+    assert border > clip_end, "border frame is stroked while the clip is still active"

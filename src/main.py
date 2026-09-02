@@ -6,11 +6,13 @@ from OpenStreetMap building data at exact architectural scales.
 """
 
 import os
+import re
 import sys
 import ssl
 import json
 import math
 import time
+import asyncio
 import tempfile
 import traceback
 import threading
@@ -53,6 +55,7 @@ try:
     from schwarzplan_engine import (
         generate_schwarzplan,
         normalize_hex,
+        MAX_QUERY_RADIUS_M,
         PAPER_SIZES,
         SCALE_OPTIONS,
         SUPPORTED_FORMATS,
@@ -62,6 +65,60 @@ try:
 except Exception as e:
     __log_crash(e)
     raise
+
+
+def mercator_y(lat):
+    """Normalised Web Mercator Y in 0..1, used to measure a latitude span."""
+    lat = max(min(lat, 85.05112878), -85.05112878)
+    s = math.sin(math.radians(lat))
+    y = 0.5 - math.log((1 + s) / (1 - s)) / (4 * math.pi)
+    # Rounding at the clamp limit can land a hair outside the range.
+    return max(0.0, min(1.0, y))
+
+
+def zoom_for_bounds(boundingbox, view_w_px=880, view_h_px=680, tile_px=256,
+                    min_zoom=3, max_zoom=17):
+    """
+    Picks a zoom level that frames a Nominatim bounding box.
+
+    boundingbox is [south, north, west, east] as strings. A fixed zoom shows a
+    country as an anonymous field and a monument as a rooftop, so the extent of
+    the result decides instead.
+    """
+    try:
+        south, north, west, east = (float(v) for v in boundingbox)
+    except (TypeError, ValueError):
+        return 14
+
+    lon_span = abs(east - west)
+    lat_span = abs(mercator_y(north) - mercator_y(south))
+
+    candidates = []
+    if lon_span > 0:
+        candidates.append(math.log2((view_w_px / tile_px) * 360.0 / lon_span))
+    if lat_span > 0:
+        candidates.append(math.log2((view_h_px / tile_px) / lat_span))
+    if not candidates:
+        return max_zoom
+    return max(min_zoom, min(max_zoom, int(math.floor(min(candidates)))))
+
+
+def parse_coordinates(text):
+    """
+    Reads a pasted "53.5581, 9.9632" into a lat/lon pair, or None.
+
+    Pasting coordinates is the one search that needs no server round-trip.
+    """
+    parts = re.split(r"[\s,;]+", (text or "").strip())
+    if len(parts) != 2:
+        return None
+    try:
+        lat, lon = float(parts[0]), float(parts[1])
+    except ValueError:
+        return None
+    if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+        return round(lat, 6), round(lon, 6)
+    return None
 
 
 def default_save_dir():
@@ -100,6 +157,8 @@ DARK_PALETTE = {
     "accent": "#4FC3F7",
     "accent_hover": "#81D4FA",
     "tile_url": "https://services.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+    # Must name whoever serves tile_url above. Change both together.
+    "tile_attribution": "Basemap \u00a9 Esri",
 }
 
 LIGHT_PALETTE = {
@@ -113,10 +172,12 @@ LIGHT_PALETTE = {
     "accent": "#0288D1",
     "accent_hover": "#039BE5",
     "tile_url": "https://services.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+    "tile_attribution": "Basemap \u00a9 Esri",
 }
 
 SUCCESS_GREEN = "#66BB6A"
 ERROR_RED = "#EF5350"
+WARNING_AMBER = "#FFA726"
 
 
 def calculate_bbox_corners(center_lat: float, center_lon: float, paper_w_mm: float, paper_h_mm: float, margin_mm: float, scale: int):
@@ -174,9 +235,11 @@ def main(page: ft.Page):
     page.bgcolor = initial_pal["bg_dark"]
     page.padding = 0
     page.window.min_width = 1020
-    page.window.min_height = 680
+    page.window.min_height = 640
+    # Kept under 1366x768, the smallest laptop screen still in common use. A
+    # taller default opens partly off-screen there.
     page.window.width = 1280
-    page.window.height = 840
+    page.window.height = 740
     page.fonts = {
         "Inter": "https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap",
     }
@@ -396,6 +459,23 @@ def main(page: ft.Page):
         (False, True, True, False): "freiraumplan",
     }
 
+    def _set_coverage(text, ok=True):
+        pal = current_theme()
+        coverage_text.value = text
+        coverage_text.color = pal["accent"] if ok else WARNING_AMBER
+        coverage_icon.color = pal["accent"] if ok else WARNING_AMBER
+        coverage_icon.icon = ft.Icons.SQUARE_FOOT if ok else ft.Icons.WARNING_AMBER_ROUNDED
+        coverage_badge.bgcolor = ft.Colors.with_opacity(
+            0.12, pal["accent"] if ok else WARNING_AMBER
+        )
+
+    def _clear_preview_box():
+        """Drop the rectangle so an invalid setting cannot leave a stale one."""
+        bbox_poly_marker.coordinates = []
+        if polygon_layer_ref.current:
+            polygon_layer_ref.current.polygons = [bbox_poly_marker]
+            polygon_layer_ref.current.update()
+
     def update_coverage_and_preview(e=None):
         try:
             try:
@@ -410,12 +490,14 @@ def main(page: ft.Page):
                 margin_mm = float(margin_field.value)
             except (TypeError, ValueError):
                 # Say so rather than freezing the badge on a stale number.
-                coverage_text.value = "Border must be a number in millimetres"
+                _set_coverage("Border must be a number in millimetres", ok=False)
+                _clear_preview_box()
                 page.update()
                 return
 
             if margin_mm < 0 or 2 * margin_mm >= min(p["width_mm"], p["height_mm"]):
-                coverage_text.value = "Border does not fit the selected paper"
+                _set_coverage("Border does not fit the selected paper", ok=False)
+                _clear_preview_box()
                 page.update()
                 return
 
@@ -424,10 +506,24 @@ def main(page: ft.Page):
                 p["width_mm"], p["height_mm"],
                 margin_mm, scale_val,
             )
-            area_km2 = (rw * rh) / 1_000_000.0
-            coverage_text.value = f"Print Coverage: {rw:.0f}m × {rh:.0f}m ({area_km2:.2f} km²)"
 
-            if not filename_is_custom[0]:
+            # Say up front that this cannot be fetched, rather than after the
+            # user has clicked Generate and waited.
+            query_radius_m = (max(rw, rh) / 2.0) * 1.15
+            if query_radius_m > MAX_QUERY_RADIUS_M:
+                _set_coverage(
+                    f"{max(rw, rh) / 1000.0:.1f} km across — too large to fetch. "
+                    f"Use a smaller sheet or a larger scale number.",
+                    ok=False,
+                )
+            else:
+                area_km2 = (rw * rh) / 1_000_000.0
+                _set_coverage(f"Print Coverage: {rw:.0f}m × {rh:.0f}m ({area_km2:.2f} km²)")
+
+            if filename_is_custom[0]:
+                # Keep the name, but track the format the user selected.
+                filename_field.value = with_extension(filename_field.value, fmt_ext)
+            else:
                 safe_paper = paper_key.lower().replace(" ", "_").replace("×", "x")
                 selection = (
                     building_layer.enabled, water_layer.enabled,
@@ -458,30 +554,48 @@ def main(page: ft.Page):
     format_dropdown.on_change = update_coverage_and_preview
     margin_field.on_change = update_coverage_and_preview
     margin_field.on_blur = update_coverage_and_preview
+    margin_field.on_submit = update_coverage_and_preview
 
     def on_filename_edited(e):
         filename_is_custom[0] = bool((filename_field.value or "").strip())
 
     filename_field.on_change = on_filename_edited
 
+    # ── Moving the map ─────────────────────────────────────────────
+    async def go_to(lat, lon, zoom=None):
+        """
+        Recentres the map and the pin on a coordinate.
+
+        Map.move_to is a coroutine. Calling it without awaiting builds the
+        coroutine and drops it, which is why the map used to stay put.
+        """
+        selected_lat[0] = lat
+        selected_lon[0] = lon
+        lat_field.value = str(lat)
+        lon_field.value = str(lon)
+
+        if marker_layer_ref.current:
+            marker_layer_ref.current.markers = [create_marker(lat, lon)]
+            marker_layer_ref.current.update()
+
+        update_coverage_and_preview()
+
+        if map_ref.current:
+            destination = ftm.MapLatitudeLongitude(lat, lon)
+            if zoom is None:
+                await map_ref.current.move_to(destination=destination)
+            else:
+                await map_ref.current.move_to(destination=destination, zoom=zoom)
+
     # ── Coordinates manual edit handler ────────────────────────────
-    def on_coords_changed(e=None):
+    async def on_coords_changed(e=None):
         try:
             lat = float(lat_field.value)
             lon = float(lon_field.value)
-            if -90 <= lat <= 90 and -180 <= lon <= 180:
-                selected_lat[0] = round(lat, 6)
-                selected_lon[0] = round(lon, 6)
-                if marker_layer_ref.current:
-                    marker_layer_ref.current.markers = [create_marker(selected_lat[0], selected_lon[0])]
-                    marker_layer_ref.current.update()
-                if map_ref.current:
-                    map_ref.current.move_to(
-                        destination=ftm.MapLatitudeLongitude(selected_lat[0], selected_lon[0])
-                    )
-                update_coverage_and_preview()
-        except Exception:
-            pass
+        except (TypeError, ValueError):
+            return
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            await go_to(round(lat, 6), round(lon, 6))
 
     lat_field.on_submit = on_coords_changed
     lat_field.on_blur = on_coords_changed
@@ -586,7 +700,20 @@ def main(page: ft.Page):
             chosen_save_dir[0] = os.path.dirname(result) or None
             filename_field.value = with_extension(os.path.basename(result), fmt)
             filename_is_custom[0] = True
+            refresh_save_dir_label()
             page.update()
+
+    save_dir_text = ft.Text(
+        "", size=10, color=initial_pal["text_secondary"], no_wrap=True,
+        tooltip="", overflow=ft.TextOverflow.ELLIPSIS,
+    )
+
+    def refresh_save_dir_label():
+        folder = chosen_save_dir[0] or default_save_dir()
+        home = os.path.expanduser("~")
+        shown = "~" + folder[len(home):] if folder.startswith(home) else folder
+        save_dir_text.value = f"Saving to {shown}"
+        save_dir_text.tooltip = folder
 
     browse_btn = ft.IconButton(
         icon=ft.Icons.FOLDER_OPEN_ROUNDED,
@@ -677,77 +804,92 @@ def main(page: ft.Page):
     )
     search_status = ft.Text("", size=11, color=initial_pal["text_secondary"])
 
+    def set_search_status(text, ok=None):
+        search_status.value = text
+        if ok is None:
+            search_status.color = current_theme()["text_secondary"]
+        else:
+            search_status.color = SUCCESS_GREEN if ok else ERROR_RED
+
+    def _geocode(query):
+        """Blocking Nominatim lookup, run off the UI loop."""
+        url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode(
+            {"q": query, "format": "json", "limit": 1}
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        try:
+            import certifi
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
     # Nominatim's usage policy allows at most one request per second and requires
     # a User-Agent that identifies the app. Going over gets the app blocked for
     # everyone using it, so the limit is enforced here rather than trusted to the
     # user's typing speed.
-    search_lock = threading.Lock()
+    search_busy = [False]
     last_search_at = [0.0]
 
-    def do_search(e=None):
+    async def do_search(e=None):
         query = (search_input.value or "").strip()
         if not query:
             return
-        if not search_lock.acquire(blocking=False):
+
+        # Pasted coordinates need no server round-trip.
+        pair = parse_coordinates(query)
+        if pair:
+            set_search_status(f"Moved to {pair[0]}, {pair[1]}", ok=True)
+            await go_to(pair[0], pair[1], zoom=16)
+            page.update()
             return
-        search_status.value = "Searching OpenStreetMap…"
-        search_status.color = current_theme()["text_secondary"]
+
+        if search_busy[0]:
+            return
+        search_busy[0] = True
+        set_search_status("Searching OpenStreetMap…")
         page.update()
 
-        def _search_thread():
-            try:
-                wait = 1.0 - (time.monotonic() - last_search_at[0])
-                if wait > 0:
-                    time.sleep(wait)
-                last_search_at[0] = time.monotonic()
+        try:
+            wait = 1.0 - (time.monotonic() - last_search_at[0])
+            if wait > 0:
+                await asyncio.sleep(wait)
+            last_search_at[0] = time.monotonic()
+            data = await asyncio.to_thread(_geocode, query)
+        except Exception:
+            set_search_status("Could not reach the search service.", ok=False)
+            page.update()
+            return
+        finally:
+            search_busy[0] = False
 
-                url = f"https://nominatim.openstreetmap.org/search?{urllib.parse.urlencode({'q': query, 'format': 'json', 'limit': 1})}"
-                req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-                try:
-                    import certifi
-                    ctx = ssl.create_default_context(cafile=certifi.where())
-                except Exception:
-                    ctx = ssl.create_default_context()
-                with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    if data:
-                        hit = data[0]
-                        new_lat = round(float(hit["lat"]), 6)
-                        new_lon = round(float(hit["lon"]), 6)
-                        display_name = hit.get("display_name", "")
-                        short_name = display_name.split(",")[0]
+        if not data:
+            set_search_status("No location found.", ok=False)
+            page.update()
+            return
 
-                        selected_lat[0] = new_lat
-                        selected_lon[0] = new_lon
-                        lat_field.value = str(new_lat)
-                        lon_field.value = str(new_lon)
+        hit = data[0]
+        try:
+            lat = round(float(hit["lat"]), 6)
+            lon = round(float(hit["lon"]), 6)
+        except (KeyError, TypeError, ValueError):
+            set_search_status("That result had no usable coordinates.", ok=False)
+            page.update()
+            return
 
-                        if marker_layer_ref.current:
-                            marker_layer_ref.current.markers = [create_marker(new_lat, new_lon)]
-                            marker_layer_ref.current.update()
-                        if map_ref.current:
-                            map_ref.current.move_to(
-                                destination=ftm.MapLatitudeLongitude(new_lat, new_lon),
-                                zoom=14,
-                            )
-                        search_status.value = f"📍 Found: {short_name}"
-                        search_status.color = SUCCESS_GREEN
-                        update_coverage_and_preview()
-                    else:
-                        search_status.value = "No location found."
-                        search_status.color = ERROR_RED
-            except Exception:
-                search_status.value = "Could not reach the search service."
-                search_status.color = ERROR_RED
-            finally:
-                search_lock.release()
-            try:
-                page.update()
-            except Exception:
-                pass
+        name = (hit.get("display_name") or query).split(",")[0]
+        set_search_status(f"\U0001F4CD {name}", ok=True)
+        await go_to(lat, lon, zoom=zoom_for_bounds(hit.get("boundingbox")))
+        page.update()
 
-        threading.Thread(target=_search_thread, daemon=True).start()
+    def on_search_typed(e):
+        """Clear a stale result or error as soon as the query changes."""
+        if search_status.value:
+            set_search_status("")
+            page.update()
 
+    search_input.on_change = on_search_typed
     search_input.on_submit = do_search
     search_btn = ft.IconButton(
         icon=ft.Icons.SEARCH_ROUNDED,
@@ -811,7 +953,9 @@ def main(page: ft.Page):
         paper_label.color = pal["text_secondary"]
         bottom_helper_text.color = pal["text_secondary"]
         bottom_helper_icon.color = pal["text_secondary"]
+        save_dir_text.color = pal["text_secondary"]
         attribution_text.color = pal["text_secondary"]
+        attribution_text.value = f"{OSM_ATTRIBUTION}  \u00b7  {pal['tile_attribution']}"
 
         div1.color = pal["border_subtle"]
         div2.color = pal["border_subtle"]
@@ -1046,6 +1190,7 @@ def main(page: ft.Page):
                     [ft.Container(content=filename_field, expand=True), browse_btn],
                     spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
+                ft.Container(content=save_dir_text, padding=ft.Padding.only(left=2, top=2)),
 
                 # Spacer
                 ft.Container(expand=True),
@@ -1082,7 +1227,7 @@ def main(page: ft.Page):
     bottom_helper_icon = ft.Icon(ft.Icons.TOUCH_APP, size=13, color=initial_pal["text_secondary"])
     bottom_helper_text = ft.Text("Click on the map to set center pin. Drag or pinch/scroll on trackpad to zoom & navigate.", size=11, color=initial_pal["text_secondary"])
     attribution_text = ft.Text(
-        f"{OSM_ATTRIBUTION}  \u00b7  Basemap \u00a9 CARTO",
+        f"{OSM_ATTRIBUTION}  \u00b7  {initial_pal['tile_attribution']}",
         size=10, color=initial_pal["text_secondary"],
     )
 
@@ -1124,6 +1269,7 @@ def main(page: ft.Page):
     )
 
     # Initialize coverage calculation & bounding box preview
+    refresh_save_dir_label()
     update_coverage_and_preview()
 
 
