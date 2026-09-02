@@ -10,7 +10,7 @@ import os
 import flet_map as ftm
 import pytest
 
-from main import mercator_y, parse_coordinates, zoom_for_bounds
+from main import MAP_MAX_ZOOM, MAP_MIN_ZOOM, mercator_y, parse_coordinates, zoom_for_bounds
 
 MAIN_PY = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "main.py"
@@ -43,7 +43,7 @@ def test_every_move_to_call_is_awaited():
     # south, north, west, east — as Nominatim returns them
     ("Germany",      ["47.2701114", "55.0991610", "5.8663153", "15.0419309"], 4, 8),
     ("Hamburg",      ["53.3951118", "54.0276500", "8.1044993", "10.3252805"], 8, 11),
-    ("Eiffel Tower", ["48.8574753", "48.8590453", "2.2933119", "2.2956897"], 15, 17),
+    ("Eiffel Tower", ["48.8574753", "48.8590453", "2.2933119", "2.2956897"], 15, MAP_MAX_ZOOM),
 ])
 def test_zoom_matches_the_size_of_the_result(name, bbox, lo, hi):
     assert lo <= zoom_for_bounds(bbox) <= hi, name
@@ -58,13 +58,14 @@ def test_bigger_area_gets_a_lower_zoom():
 
 @pytest.mark.parametrize("bbox", [None, [], ["a", "b", "c", "d"], ["1", "2"], "nonsense"])
 def test_unusable_bounds_fall_back_to_a_sane_zoom(bbox):
-    assert 3 <= zoom_for_bounds(bbox) <= 17
+    assert MAP_MIN_ZOOM <= zoom_for_bounds(bbox) <= MAP_MAX_ZOOM
 
 
 def test_zoom_is_clamped_to_the_map_limits():
-    # A zero-size bounding box would otherwise ask for infinite zoom.
-    assert zoom_for_bounds(["53.5", "53.5", "9.9", "9.9"]) <= 17
-    assert zoom_for_bounds(["-85", "85", "-180", "180"]) >= 3
+    # A zero-size bounding box would otherwise ask for infinite zoom, and the
+    # whole world would ask for less than the map allows.
+    assert zoom_for_bounds(["53.5", "53.5", "9.9", "9.9"]) <= MAP_MAX_ZOOM
+    assert zoom_for_bounds(["-85", "85", "-180", "180"]) >= MAP_MIN_ZOOM
 
 
 def test_mercator_y_handles_the_poles():

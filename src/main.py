@@ -67,6 +67,12 @@ except Exception as e:
     raise
 
 
+# Esri's Light/Dark Gray Canvas is published up to zoom 16. Asking for more
+# gives blank tiles, so the map, the tile layers and the search all use these.
+MAP_MIN_ZOOM = 2
+MAP_MAX_ZOOM = 16
+
+
 def mercator_y(lat):
     """Normalised Web Mercator Y in 0..1, used to measure a latitude span."""
     lat = max(min(lat, 85.05112878), -85.05112878)
@@ -77,7 +83,7 @@ def mercator_y(lat):
 
 
 def zoom_for_bounds(boundingbox, view_w_px=880, view_h_px=680, tile_px=256,
-                    min_zoom=3, max_zoom=17):
+                    min_zoom=MAP_MIN_ZOOM, max_zoom=MAP_MAX_ZOOM):
     """
     Picks a zoom level that frames a Nominatim bounding box.
 
@@ -88,7 +94,7 @@ def zoom_for_bounds(boundingbox, view_w_px=880, view_h_px=680, tile_px=256,
     try:
         south, north, west, east = (float(v) for v in boundingbox)
     except (TypeError, ValueError):
-        return 14
+        return min(14, max_zoom)
 
     lon_span = abs(east - west)
     lat_span = abs(mercator_y(north) - mercator_y(south))
@@ -157,6 +163,7 @@ DARK_PALETTE = {
     "accent": "#4FC3F7",
     "accent_hover": "#81D4FA",
     "tile_url": "https://services.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+    "label_url": "https://services.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}",
     # Must name whoever serves tile_url above. Change both together.
     "tile_attribution": "Basemap \u00a9 Esri",
 }
@@ -172,6 +179,7 @@ LIGHT_PALETTE = {
     "accent": "#0288D1",
     "accent_hover": "#039BE5",
     "tile_url": "https://services.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+    "label_url": "https://services.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}",
     "tile_attribution": "Basemap \u00a9 Esri",
 }
 
@@ -257,6 +265,7 @@ def main(page: ft.Page):
     marker_layer_ref = ft.Ref[ftm.MarkerLayer]()
     polygon_layer_ref = ft.Ref[ftm.PolygonLayer]()
     tile_layer_ref = ft.Ref[ftm.TileLayer]()
+    label_layer_ref = ft.Ref[ftm.TileLayer]()
     map_ref = ft.Ref[ftm.Map]()
 
     # ── Helpers ────────────────────────────────────────────────────
@@ -753,9 +762,21 @@ def main(page: ft.Page):
         url_template=initial_pal["tile_url"],
         user_agent_package_name="schwarzplan.app.user_agent",
         min_native_zoom=0,
-        max_native_zoom=16,
-        min_zoom=2,
-        max_zoom=16,
+        max_native_zoom=MAP_MAX_ZOOM,
+        min_zoom=MAP_MIN_ZOOM,
+        max_zoom=MAP_MAX_ZOOM,
+    )
+
+    # Street and place names ride on top of the grey canvas as their own
+    # transparent service.
+    label_layer = ftm.TileLayer(
+        ref=label_layer_ref,
+        url_template=initial_pal["label_url"],
+        user_agent_package_name="schwarzplan.app.user_agent",
+        min_native_zoom=0,
+        max_native_zoom=MAP_MAX_ZOOM,
+        min_zoom=MAP_MIN_ZOOM,
+        max_zoom=MAP_MAX_ZOOM,
     )
 
     polygon_layer = ftm.PolygonLayer(
@@ -783,14 +804,15 @@ def main(page: ft.Page):
         expand=True,
         initial_center=ftm.MapLatitudeLongitude(selected_lat[0], selected_lon[0]),
         initial_zoom=14,
-        min_zoom=2,
-        max_zoom=16,
+        min_zoom=MAP_MIN_ZOOM,
+        max_zoom=MAP_MAX_ZOOM,
         on_tap=on_map_tap,
         interaction_configuration=ftm.InteractionConfiguration(
             flags=ftm.InteractionFlag.ALL,
         ),
         layers=[
             tile_layer,
+            label_layer,
             polygon_layer,
             marker_layer,
         ],
@@ -927,6 +949,9 @@ def main(page: ft.Page):
         if tile_layer_ref.current:
             tile_layer_ref.current.url_template = pal["tile_url"]
             tile_layer_ref.current.update()
+        if label_layer_ref.current:
+            label_layer_ref.current.url_template = pal["label_url"]
+            label_layer_ref.current.update()
         if map_ref.current:
             map_ref.current.update()
 
